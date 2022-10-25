@@ -1,55 +1,9 @@
-from abc import ABC
-from abc import abstractmethod
 from collections import OrderedDict
 import jax.numpy as jnp
-import jax.random as jr
-import jax.scipy as jsp
-from jax import vmap, jit
-from dynamax.distributions import InverseWishart as IW
-from dynamax.distributions import MatrixNormalPrecision as MN
-from dynamax.structural_time_series.models.structural_time_series_ssm import GaussianSSM, PoissonSSM
-import optax
-from tensorflow_probability.substrates.jax.distributions import MultivariateNormalFullCovariance as MVN
+from sts_model import STSComponent
 
 
-def _set_prior(input_prior, default_prior):
-    return input_prior if input_prior is not None else default_prior
-
-
-class STSLatentComponent(ABC):
-
-    @property
-    @abstractmethod
-    def transition_matrix(self):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def observation_matrix(self):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def transition_covariance(self):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def transition_covariance_prior(self):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def initial_state_prior(self):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def cov_spars_matrix(self):
-        raise NotImplementedError
-
-
-class LocalLinearTrend(STSLatentComponent):
+class LocalLinearTrend(STSComponent):
     """The local linear trend component of the structual time series (STS) model
 
     level[t+1] = level[t] + slope[t] + N(0, level_covariance)
@@ -70,179 +24,49 @@ class LocalLinearTrend(STSLatentComponent):
     """
 
     def __init__(self,
-                 level_covariance_prior=None,
-                 slope_covariance_prior=None,
-                 initial_level_prior=None,
-                 initial_slope_prior=None,
-                 observed_time_series=None,
-                 dim_observed_timeseries=1,
-                 name='LocalLinearTrend'):
-        if observed_time_series is not None:
-            _dim = observed_time_series.shape
-            self.dim_obs = 1 if len(_dim) == 1 else _dim[-1]
-            obs_scale = jnp.std(jnp.abs(jnp.diff(observed_time_series, axis=0)), axis=0).mean()
-            obs_init = observed_time_series[0].mean()
-        else:
-            self.dim_obs = dim_observed_timeseries
-            obs_scale = 1.
-            obs_init = 0.
-
-        self.component_name = name
-
-        # Initialize the prior using the observed time series if a prior is not specified
-        self.level_covariance_prior = _set_prior(
-            level_covariance_prior,
-            IW(df=self.dim_obs, scale=1e-3*obs_scale**2*jnp.eye(self.dim_obs)))
-
-        self.slope_covariance_prior = _set_prior(
-            slope_covariance_prior,
-            IW(df=self.dim_obs, scale=1e-3*obs_scale**2*jnp.eye(self.dim_obs)))
-
-        self.initial_level_prior = _set_prior(
-            initial_level_prior,
-            MVN(loc=obs_init * jnp.ones(self.dim_obs),
-                covariance_matrix=obs_scale*jnp.eye(self.dim_obs)))
-        assert isinstance(self.initial_level_prior, MVN)
-
-        self.initial_slope_prior = _set_prior(
-            initial_slope_prior,
-            MVN(loc=jnp.zeros(self.dim_obs), covariance_matrix=jnp.eye(self.dim_obs)))
-        assert isinstance(self.initial_slope_prior, MVN)
+                 dim_obs=1,
+                 name='local_linear_trend'):
+        self.name = name
+        self.dim_obs = dim_obs
+        self.params = OrderedDict()
+        self.params['cov_level'] = None
+        self.params['cov_slope'] = None
 
     @property
-    def transition_matrix(self):
-        return {self.component_name:
-                jnp.block([[jnp.eye(self.dim_obs), jnp.eye(self.dim_obs)],
-                           [jnp.zeros((self.dim_obs, self.dim_obs)), jnp.eye(self.dim_obs)]])}
+    def get_trans_mat(self):
+        return jnp.block([[jnp.eye(self.dim_obs), jnp.eye(self.dim_obs)],
+                          [jnp.zeros((self.dim_obs, self.dim_obs)), jnp.eye(self.dim_obs)]])
 
     @property
-    def observation_matrix(self):
-        return {self.component_name:
-                jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))])}
+    def get_obs_mat(self):
+        return jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))])
 
     @property
-    def transition_covariance(self):
-        return OrderedDict({'local_linear_level': self.level_covariance_prior.mode(),
-                            'local_linear_slope': self.slope_covariance_prior.mode()})
+    def get_trans_cov(self):
+        return jnp.block([[self.params['cov_level'], jnp.zeros((self.dim_obs, self.dim_obs))],
+                          [jnp.zeros((self.dim_obs, self.dim_obs)), self.params['cov_slope']]])
+
+
+class Autoregressive(STSComponent):
+    def __init__(self, dim_obs=1, name='ar'):
+        self.name = name
+        self.dim_obs = dim_obs
+        self.params = OrderedDict()
 
     @property
-    def transition_covariance_prior(self):
-        return OrderedDict({'local_linear_level': self.level_covariance_prior,
-                            'local_linear_slope': self.slope_covariance_prior})
+    def get_trans_mat(self, t):
+        return
 
     @property
-    def initial_state_prior(self):
-        return OrderedDict({'local_linear_level': self.initial_level_prior,
-                            'local_linear_slope': self.initial_slope_prior})
+    def get_obs_mat(self):
+        return
 
     @property
-    def cov_spars_matrix(self):
-        return OrderedDict({'local_linear_level': jnp.eye(self.dim_obs),
-                            'local_linear_slope': jnp.eye(self.dim_obs)})
+    def get_trans_cov(self, t):
+        return
 
 
-class Autoregressive(STSLatentComponent):
-    """Autoregressive component
-    """
-
-    def __init__(self,
-                 order,
-                 coefficients_prior=None,
-                 level_scale_prior=None,
-                 initial_state_prior=None,
-                 observed_time_series=None,
-                 dim_observed_timeseries=1,
-                 name='Autoregressive'):
-        if observed_time_series is not None:
-            _dim = observed_time_series.shape
-            self.dim_obs = 1 if len(_dim) == 1 else _dim[-1]
-            obs_scale = jnp.std(jnp.abs(jnp.diff(observed_time_series, axis=0)), axis=0).mean()
-            obs_init = observed_time_series[0].mean()
-        else:
-            self.dim_obs = dim_observed_timeseries
-            obs_scale = 1.
-            obs_init = 0.
-
-        self.component_name = name
-
-        # Initialize the prior using the observed time series if a prior is not specified
-        self.level_covariance_prior = _set_prior(
-            level_covariance_prior,
-            IW(df=self.dim_obs, scale=1e-3*obs_scale**2*jnp.eye(self.dim_obs)))
-
-        self.slope_covariance_prior = _set_prior(
-            slope_covariance_prior,
-            IW(df=self.dim_obs, scale=1e-3*obs_scale**2*jnp.eye(self.dim_obs)))
-
-        self.initial_level_prior = _set_prior(
-            initial_level_prior,
-            MVN(loc=obs_init * jnp.ones(self.dim_obs),
-                covariance_matrix=obs_scale*jnp.eye(self.dim_obs)))
-        assert isinstance(self.initial_level_prior, MVN)
-
-        self.initial_slope_prior = _set_prior(
-            initial_slope_prior,
-            MVN(loc=jnp.zeros(self.dim_obs), covariance_matrix=jnp.eye(self.dim_obs)))
-        assert isinstance(self.initial_slope_prior, MVN)
-
-    @property
-    def transition_matrix(self):
-        return {self.component_name:
-                jnp.block([[jnp.eye(self.dim_obs), jnp.eye(self.dim_obs)],
-                           [jnp.zeros((self.dim_obs, self.dim_obs)), jnp.eye(self.dim_obs)]])}
-
-    @property
-    def observation_matrix(self):
-        return {self.component_name:
-                jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))])}
-
-    @property
-    def transition_covariance(self):
-        return OrderedDict({'local_linear_level': self.level_covariance_prior.mode(),
-                            'local_linear_slope': self.slope_covariance_prior.mode()})
-
-    @property
-    def transition_covariance_prior(self):
-        return OrderedDict({'local_linear_level': self.level_covariance_prior,
-                            'local_linear_slope': self.slope_covariance_prior})
-
-    @property
-    def initial_state_prior(self):
-        return OrderedDict({'local_linear_level': self.initial_level_prior,
-                            'local_linear_slope': self.initial_slope_prior})
-
-    @property
-    def cov_spars_matrix(self):
-        return OrderedDict({'local_linear_level': jnp.eye(self.dim_obs),
-                            'local_linear_slope': jnp.eye(self.dim_obs)})
-
-
-class LinearRegression():
-    """The static regression component of the structual time series (STS) model
-
-    Args:
-        weights_prior: MatrixNormal prior for the weight matrix
-        weights_shape: Dimension of the observed time series
-        name (str): Name of the component in the STS model
-    """
-
-    def __init__(self,
-                 weights_shape,
-                 weights_prior=None,
-                 name='LinearRegression'):
-        self.dim_obs, self.dim_inputs = weights_shape
-        self.component_name = name
-
-        # Initialize the prior distribution for weights
-        if weights_prior is None:
-            weights_prior = MN(loc=jnp.zeros(weights_shape),
-                               row_covariance=jnp.eye(self.dim_obs),
-                               col_precision=jnp.eye(self.dim_inputs))
-
-        self.weights_prior = weights_prior
-
-
-class Seasonal(STSLatentComponent):
+class SeasonalDummy(STSComponent):
     """The (dummy) seasonal component of the structual time series (STS) model
     Since on average sum_{j=0}^{num_seasons-1}s_{t+1-j} = 0 for any t,
     the seasonal effect (random) for next time step is:
@@ -262,75 +86,44 @@ class Seasonal(STSLatentComponent):
     def __init__(self,
                  num_seasons,
                  num_steps_per_season=1,
-                 drift_covariance_prior=None,
-                 initial_effect_prior=None,
-                 observed_time_series=None,
-                 dim_observed_timeseries=1,
-                 name='Seasonal'):
-        if observed_time_series is not None:
-            _dim = observed_time_series.shape
-            self.dim_obs = 1 if len(_dim) == 1 else _dim[-1]
-            obs_scale = jnp.std(jnp.abs(jnp.diff(observed_time_series, axis=0)), axis=0).mean()
+                 dim_obs=1,
+                 name='seasonal_dummy'):
+        self.name = name
+        self.dim_obs = dim_obs
+        self.steps_per_season = num_steps_per_season
+
+        self.trans_mat = jnp.block(
+            [[jnp.kron(-jnp.ones(self.num_seasons-1), jnp.eye(self.dim_obs))],
+             [jnp.eye((self.num_seasons-2)*self.dim_obs),
+              jnp.zeros(((self.num_seasons-2)*self.dim_obs, self.dim_obs))]])
+        self.obs_mat = jnp.block(
+            [jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])
+
+        self.params = OrderedDict()
+        self.params['drift_cov'] = None
+
+    @property
+    def get_trans_mat(self, t):
+        update = t % self.steps_per_season == 0
+        if update:
+            return self.trans_mat
         else:
-            self.dim_obs = dim_observed_timeseries
-            obs_scale = 1.
-
-        self.num_seasons = num_seasons
-        self.num_steps_per_season = num_steps_per_season
-        self.component_name = name
-
-        self.initial_effect_prior = _set_prior(
-            initial_effect_prior,
-            MVN(loc=jnp.zeros(self.dim_obs),
-                covariance_matrix=obs_scale**2*jnp.eye(self.dim_obs)))
-
-        self.drift_covariance_prior = _set_prior(
-            drift_covariance_prior,
-            IW(df=self.dim_obs, scale=1e-3*obs_scale**2*jnp.eye(self.dim_obs)))
+            return jnp.eye(self.dim_obs)
 
     @property
-    def transition_matrix(self):
-        # TODO: allow num_steps_per_season > 1 or be a list of integers
-        return {self.component_name:
-                jnp.block([[jnp.kron(-jnp.ones(self.num_seasons-1), jnp.eye(self.dim_obs))],
-                           [jnp.eye((self.num_seasons-2)*self.dim_obs),
-                            jnp.zeros(((self.num_seasons-2)*self.dim_obs, self.dim_obs))]])}
+    def get_obs_mat(self):
+        return self.obs_mat
 
     @property
-    def observation_matrix(self):
-        return {self.component_name:
-                jnp.block([jnp.eye(self.dim_obs),
-                           jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])}
-
-    @property
-    def transition_covariance(self):
-        return {'seasonal': self.drift_covariance_prior.mode()}
-
-    @property
-    def transition_covariance_prior(self):
-        return {'seasonal': self.drift_covariance_prior}
-
-    @property
-    def initial_state_prior(self):
-        c = self.num_seasons - 1
-        initial_loc = jnp.array([self.initial_effect_prior.mean()]*c).flatten()
-        initial_cov = jsp.linalg.block_diag(
-            *([self.initial_effect_prior.covariance()]*c))
-        initial_pri = MVN(loc=initial_loc, covariance_matrix=initial_cov)
-        return {'seasonal': initial_pri}
-
-    @property
-    def cov_spars_matrix(self):
-        return {'seasonal': jnp.concatenate(
-                    (
-                        jnp.eye(self.dim_obs),
-                        jnp.zeros((self.dim_obs*(self.num_seasons-2), self.dim_obs)),
-                    ),
-                    axis=0)
-                }
+    def get_trans_cov(self, t):
+        update = t % self.steps_per_season == 0
+        if update:
+            return self.params['drift_cov']
+        else:
+            return jnp.zeros((self.dim_obs, self.dim_obs))
 
 
-class SeasonalTrig(STSLatentComponent):
+class SeasonalTrig(STSComponent):
     """The trigonometric seasonal component of the structual time series (STS) model
     (Current formulation only support 1-d observation case)
 
@@ -354,34 +147,20 @@ class SeasonalTrig(STSLatentComponent):
     def __init__(self,
                  num_seasons,
                  num_steps_per_season=1,
-                 drift_covariance_prior=None,
-                 initial_effect_prior=None,
-                 observed_time_series=None,
-                 dim_observed_timeseries=1,
-                 name='TrigonometricSeasonal'):
-        if observed_time_series is not None:
-            _dim = observed_time_series.shape
-            self.dim_obs = 1 if len(_dim) == 1 else _dim[-1]
-            obs_scale = jnp.std(jnp.abs(jnp.diff(observed_time_series, axis=0)), axis=0).mean()
-        else:
-            self.dim_obs = dim_observed_timeseries
-            obs_scale = 1.
+                 dim_obs=1,
+                 name='seasonal_trig'):
+        self.name = name
+        self.dim_obs = self.dim_obs
 
         self.num_seasons = num_seasons
         self.num_steps_per_season = num_steps_per_season
         self.component_name = name
 
-        self.initial_effect_prior = _set_prior(
-            initial_effect_prior,
-            MVN(loc=jnp.zeros(self.dim_obs),
-                covariance_matrix=obs_scale**2*jnp.eye(self.dim_obs)))
-
-        self.drift_covariance_prior = _set_prior(
-            drift_covariance_prior,
-            IW(df=self.dim_obs, scale=1e-3*obs_scale**2*jnp.eye(self.dim_obs)))
+        self.params = OrderedDict()
+        self.params['drift_cov'] = None
 
     @property
-    def transition_matrix(self):
+    def get_trans_mat(self, t):
         num_pairs = int(jnp.floor(self.num_seasons/2.))
         matrix = jnp.zeros((2*num_pairs, 2*num_pairs))
         for j in 1 + jnp.arange(num_pairs):
@@ -394,33 +173,90 @@ class SeasonalTrig(STSLatentComponent):
         return {self.component_name: matrix}
 
     @property
-    def observation_matrix(self):
+    def get_obs_mat(self):
         num_pairs = int(jnp.floor(self.num_seasons/2.))
-        matrix = jnp.tile(jnp.array([1, 0]), num_pairs)
+        matrix = jnp.tile(
+            jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))]), num_pairs)
         if self.num_seasons % 2 == 0:
-            matrix = matrix[:-1]
-        return {self.component_name: matrix[None, :]}
+            matrix = matrix[:-self.dim_obs, :]
+        return matrix
 
     @property
-    def transition_covariance(self):
-        # TODO: This formulation does not force all seasons have same drift variance
-        covs = {f'season_{j}': self.drift_covariance_prior.mode() for j in range(self.num_seasons-1)}
-        return OrderedDict(covs)
+    def get_trans_cov(self, t):
+        return jnp.kron(jnp.eye(self.num_seasons-1), self.params['drift_cov'])
+
+
+class Cycle(STSComponent):
+    """The cycle component of the structural time series model
+
+    Args:
+        damp (array(dim_ts)): damping factor
+        frequency (array(dim_ts)): frequency factor
+    """
+
+    def __init__(self, damp=None, frequency=None, covariance=None, dim_obs=1, name='cycle'):
+        self.name = name
+        if damp is not None:
+            dim_obs = len(damp)
+            assert all(damp > 0.) and all(damp < 1.), "The damping factor shoul be in range (0, 1)."
+
+        self. dim_obs = dim_obs
+
+        # Parameters of the component
+        self.params = OrderedDict()
+        self.params['damp'] = damp
+        self.params['frequency'] = frequency
+        self.params['cov'] = covariance
 
     @property
-    def transition_covariance_prior(self):
-        cov_priors = {f'season_{j}': self.drift_covariance_prior for j in range(self.num_seasons)}
-        return OrderedDict(cov_priors)
+    def get_trans_mat(self):
+        damp = jnp.diag(self.params['damp'])
+        cos_fr = jnp.diag(jnp.cos(self.params['frequency']))
+        sin_fr = jnp.diag(jnp.sin(self.params['frequency']))
+        return jnp.block([[damp*cos_fr, damp*sin_fr],
+                          [-damp*sin_fr, damp*cos_fr]])
 
     @property
-    def initial_state_prior(self):
-        c = self.num_seasons - 1
-        initial_loc = jnp.array([self.initial_effect_prior.mean()]*c).flatten()
-        initial_cov = jsp.linalg.block_diag(
-            *([self.initial_effect_prior.covariance()]*c))
-        initial_pri = MVN(loc=initial_loc, covariance_matrix=initial_cov)
-        return {'trig_seasonal': initial_pri}
+    def get_obs_mat(self):
+        return jnp.block([jnp.eye(self.dim_obs), jnp.zeros(self.dim_obs, self.dim_obs)])
 
     @property
-    def cov_spars_matrix(self):
-        return {'trig_seasonal': jnp.eye(self.num_seasons-1)}
+    def get_trans_cov(self):
+        Q = self.params['cov']
+        return jnp.block([[Q, jnp.zeros_like(Q)],
+                          [jnp.zeros_like(Q), Q]])
+
+
+class LinearRegression(STSComponent):
+    """The linear regression component of the structural time series model.
+
+    Args:
+        STSComponent (_type_): _description_
+    """
+    def __init__(self, covariates, add_bias_term=True, dim_obs=1, name='linear_regression'):
+        self.name = name
+        self.dim_obs = dim_obs
+        if add_bias_term:
+            self.inputs = jnp.concatenate((covariates, jnp.ones((len(covariates), 1))), axis=1)
+        else:
+            self.inputs = covariates
+        dim_inputs = self.inputs.shape[-1]
+        weights = jnp.zeros((dim_inputs, dim_obs))
+        self.params = OrderedDict()
+        self.params['weights'] = weights
+
+    @property
+    def get_trans_mat(self):
+        return jnp.eye(self.dim_obs)
+
+    @property
+    def get_obs_mat(self, t):
+        # Set the emission matrix to be the fitted value of the regression model,
+        # since we set the latent state for the regression term to be a vector of 1s.
+        fitted_value = self.params['weights'] @ self.inputs[t]
+        return jnp.diag(fitted_value)
+
+    @property
+    def get_trans_cov(self):
+        # The regression component does not have a noise term
+        return jnp.zeros((self.dim_obs, self.dim_obs))
