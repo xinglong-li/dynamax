@@ -163,15 +163,9 @@ class _StructuralTimeSeriesSSM(SSM):
         samp_emissions = jnp.concatenate((jnp.expand_dims(initial_emission, 0), emissions))
         return samp_states, samp_emissions
 
-    def marginal_log_prob(self, emissions, inputs=None, params=None):
+    def marginal_log_prob(self, params, emissions, inputs=None):
         """Compute log marginal likelihood of observations."""
-        if params is None:
-            # Compute marginal log prob using current parameter
-            ssm_params = self._to_ssm_params(self.params)
-        else:
-            # Compute marginal log prob using given parameter
-            ssm_params = self._to_ssm_params(params)
-
+        ssm_params = self._to_ssm_params(params)
         filtered_posterior = self._ssm_filter(params=ssm_params, emissions=emissions, inputs=inputs)
         return filtered_posterior.marginal_loglik
 
@@ -230,7 +224,7 @@ class _StructuralTimeSeriesSSM(SSM):
             params = from_unconstrained(trainable_unc_params, fixed_params, self.param_props)
             log_det_jac = log_det_jac_constrain(trainable_unc_params, fixed_params, self.param_props)
             log_pri = self.log_prior(params) + log_det_jac
-            batch_lls = self.marginal_log_prob(emissions, inputs, params)
+            batch_lls = self.marginal_log_prob(params, emissions, inputs)
             lp = log_pri + batch_lls.sum()
             return lp
 
@@ -302,7 +296,7 @@ class _StructuralTimeSeriesSSM(SSM):
             params = from_unconstrained(unc_params, fixed_params, self.param_props)
             log_det_jac = log_det_jac_constrain(unc_params, fixed_params, self.param_props)
             log_pri = self.log_prior(params) + log_det_jac
-            batch_lls = self.marginal_log_prob(emissions, inputs, params)
+            batch_lls = self.marginal_log_prob(params, emissions, inputs)
             lp = log_pri + batch_lls.sum()
             return lp
 
