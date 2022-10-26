@@ -24,7 +24,7 @@ from dynamax.parameters import (
     flatten,
     unflatten,
     ParameterProperties)
-from dynamax.utils import PSDToRealBijector
+from dynamax.utils import PSDToRealBijector, pytree_sum
 import tensorflow_probability.substrates.jax.bijectors as tfb
 from tensorflow_probability.substrates.jax.distributions import (
     MultivariateNormalFullCovariance as MVN,
@@ -63,22 +63,22 @@ class _StructuralTimeSeriesSSM(SSM):
         self.get_obs_mat = get_obs_mat
         self.get_obs_cov = get_obs_cov
 
+        self.initial_mean = 
+        self.initial_covariance = 
+
     @property
     def emission_shape(self):
         return (self.emission_dim,)
 
     def log_prior(self, params):
-        lp = jnp.array([
-            c_prior.log_prob(param) for cov, cov_prior in zip(
-            params['dynamics_covariances'].values(), self.priors['dynamics_covariances'].values()
-            )]).sum()
-        return lp
+        lps = tree_map(lambda prior, param: prior.log_prob(param), self.param_priors, params)
+        return pytree_sum(lps)
 
     # Instantiate distributions of the SSM model
     def initial_distribution(self):
         """Gaussian distribution of the initial state of the SSM model.
         """
-        return MVN(self.initial_mean, self.initial_covariance)
+        raise NotImplementedError
 
     def transition_distribution(self, state):
         """Not implemented because tfp.distribution does not allow
