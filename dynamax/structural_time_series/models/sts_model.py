@@ -59,19 +59,25 @@ class StructuralTimeSeries():
             c.initialize_params(obs_scale)
 
         # Aggeragate components
+        self.initial_mean = []
+        self.initial_cov = []
         self.params = OrderedDict()
         self.param_props = OrderedDict()
         self.priors = OrderedDict()
         self.trans_mat_getters = OrderedDict()
         self.obs_mat_getters = OrderedDict()
         self.trans_cov_getters = OrderedDict()
+
         for c in components.items:
+            self.initial_mean.append(c.initial_mean)
+            self.initial_cov.append(c.initial_cov)
             self.params[c.name] = c.params
             self.param_props[c.name] = c.param_props
             self.priors[c.name] = c.param_props
             self.trans_mat_getters[c.name] = c.get_trans_mat
             self.obs_mat_getters[c.name] = c.get_obs_mat
             self.trans_cov_getters[c.name] = c.get_trans_cov
+
         self.params['obs_cov'] = obs_cov
         self.param_props['obs_cov'] = obs_cov_props
         self.priors['obs_cov'] = obs_cov_prior
@@ -116,22 +122,13 @@ class StructuralTimeSeries():
         if the STS model includes an regression component
         """
         if self.obs_family == 'Gaussian':
-            sts_ssm = GaussianSSM(self.params, self.param_props, self.priors,
-                                  self.get_trans_mat,
-                                  self.get_obs_mat,
-                                  self.initial_state_priors,
-                                  self.get_trans_cov,
-                                  self.transition_covariance_priors,
-                                  self.observation_covariance,
-                                  self.observation_covariance_prior,
-                                  self.cov_spars_matrices)
+            sts_ssm = GaussianSSM(
+                self.params, self.param_props, self.priors, self.get_trans_mat, self.get_obs_mat,
+                self.get_trans_cov, self.initial_mean, self.initial_cov, self.cov_select_mat)
         elif self.obs_family == 'Poisson':
-            sts_ssm = PoissonSSM(self.get_trans_mat,
-                                 self.get_obs_mat,
-                                 self.initial_state_priors,
-                                 self.get_trans_cov,
-                                 self.transition_covariance_priors,
-                                 self.cov_spars_matrices)
+            sts_ssm = PoissonSSM(
+                self.params, self.param_props, self.priors, self.get_trans_mat, self.get_obs_mat,
+                self.get_trans_cov, self.initial_mean, self.initial_cov, self.cov_select_mat)
         return sts_ssm
 
     def decompose_by_component(self, observed_time_series, inputs=None,

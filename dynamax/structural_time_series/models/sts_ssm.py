@@ -52,19 +52,24 @@ class _StructuralTimeSeriesSSM(SSM):
     def __init__(self,
                  params,
                  param_props,
-                 param_priors,
+                 priors,
                  get_trans_mat,
                  get_obs_mat,
-                 get_obs_cov):
+                 get_trans_cov,
+                 initial_mean,
+                 initial_cov,
+                 cov_select_mat):
         self.params = params
         self.param_props = param_props
-        self.param_priors = param_priors
+        self.param_priors = priors
+
+        self.initial_mean = initial_mean
+        self.initial_covariance = initial_cov
+        self.sparse_mat = cov_select_mat
+
         self.get_trans_mat = get_trans_mat
         self.get_obs_mat = get_obs_mat
         self.get_obs_cov = get_obs_cov
-
-        self.initial_mean = 
-        self.initial_covariance = 
 
     @property
     def emission_shape(self):
@@ -76,7 +81,8 @@ class _StructuralTimeSeriesSSM(SSM):
 
     # Instantiate distributions of the SSM model
     def initial_distribution(self):
-        """Gaussian distribution of the initial state of the SSM model.
+        """Distribution of the initial state of the SSM model.
+        Not implement because some component has 0 covariances.
         """
         raise NotImplementedError
 
@@ -86,19 +92,17 @@ class _StructuralTimeSeriesSSM(SSM):
         """
         raise NotImplementedError
 
-    def emission_distribution(self, state, inputs=None):
+    def emission_distribution(self, state):
         """Depends on the distribution family of the observation.
         """
         raise NotImplementedError
 
-    def sample(self, key, num_timesteps, inputs=None):
+    def sample(self, key, num_timesteps):
         """Sample a sequence of latent states and emissions.
         Args:
             key: rng key
             num_timesteps: length of sequence to generate
         """
-        if inputs is None:
-            inputs = jnp.zeros((num_timesteps, 0))
         comp_cov = jsp.linalg.block_diag(*self.params['dynamics_covariances'].values())
         dim_comp = comp_cov.shape[-1]
         spars_matrix = jsp.linalg.block_diag(*self.spars_matrix.values())
@@ -124,13 +128,13 @@ class _StructuralTimeSeriesSSM(SSM):
         samp_emissions = jnp.concatenate((jnp.expand_dims(initial_emission, 0), emissions))
         return samp_states, samp_emissions
 
-    def marginal_log_prob(self, params, emissions, inputs=None):
+    def marginal_log_prob(self, params, emissions):
         """Compute log marginal likelihood of observations."""
         ssm_params = self._to_ssm_params(params)
-        filtered_posterior = self._ssm_filter(params=ssm_params, emissions=emissions, inputs=inputs)
+        filtered_posterior = self._ssm_filter(params=ssm_params, emissions=emissions)
         return filtered_posterior.marginal_loglik
 
-    def posterior_sample(self, key, observed_time_series, inputs=None):
+    def posterior_sample(self, key, observed_time_series):
         num_timesteps, dim_obs = observed_time_series.shape
         if inputs is None:
             inputs = jnp.zeros((num_timesteps, 0))
@@ -142,13 +146,13 @@ class _StructuralTimeSeriesSSM(SSM):
                                                                 sample_shape=num_timesteps)
         return obs_means, obs
 
-    def component_posterior(self, emissions, inputs):
+    def component_posterior(self, emissions):
         """Smoothing by component
         """
         # Compute the posterior of the joint SSM model
         component_pos = OrderedDict()
         ssm_params = self._to_ssm_params(self.params)
-        pos = self._ssm_smoother(ssm_params, emissions, inputs)
+        pos = self._ssm_smoother(ssm_params, emissions)
         mu_pos = pos.smoothed_means
         var_pos = pos.smoothed_covariances
 
@@ -163,13 +167,6 @@ class _StructuralTimeSeriesSSM(SSM):
             c_emission_var = vmap(lambda s, m: m @ s @ m.T, (0, None))(c_var, emission_matrix)
             component_pos[c] = (c_emission_constrained_mu, c_emission_var)
             _loc += c_dim
-
-        # Include the regression effect if the model has the regression component
-        if inputs is not None:
-            W = self.params['regression_weights']
-            regression_effect = vmap(lambda w, x: w @ x, (None, 0))(W, inputs)
-            # Given the regression weight, the regression effect is not random
-            component_pos['Regression'] = (regression_effect, jnp.zeros((inputs.shape[0], W.shape[0])))
 
         return component_pos
 
