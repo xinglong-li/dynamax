@@ -1,5 +1,6 @@
 import blackjax
 from collections import OrderedDict
+from functools import partial
 from jax import jit, lax, vmap
 import jax.numpy as jnp
 import jax.random as jr
@@ -49,58 +50,18 @@ class _StructuralTimeSeriesSSM(SSM):
     """
 
     def __init__(self,
-                 component_transition_matrices,
-                 component_observation_matrices,
-                 component_initial_state_priors,
-                 component_transition_covariances,
-                 component_transition_covariance_priors,
-                 cov_spars_matrices):
-
-        # Set parameters for the initial state of the LinearGaussianSSM model
-        self.initial_mean = jnp.concatenate(
-            [init_pri.mode() for init_pri in component_initial_state_priors.values()]
-            )
-        self.initial_covariance = jsp.linalg.block_diag(
-            *[init_pri.covariance() for init_pri in component_initial_state_priors.values()]
-            )
-        # Set parameters of the dynamics model of the LinearGaussainSSM model
-        self.dynamics_matrix = jsp.linalg.block_diag(*component_transition_matrices.values())
-        self.state_dim = self.dynamics_matrix.shape[-1]
-        self.dynamics_bias = jnp.zeros(self.state_dim)
-        dynamics_covariance_props = OrderedDict()
-        for c in component_transition_covariance_priors.keys():
-            dynamics_covariance_props[c] = ParameterProperties(
-                trainable=True, constrainer=tfb.Invert(PSDToRealBijector))
-        self.spars_matrix = cov_spars_matrices
-
-        # Set parameters of the emission model of the LinearGaussianSSM model
-        self.component_emission_matrices = component_observation_matrices
-        self.emission_matrix = jnp.concatenate(list(component_observation_matrices.values()), axis=1)
-        self.emission_dim = self.emission_matrix.shape[0]
-        if observation_regression_weights is not None:
-            emission_input_weights = observation_regression_weights
-            shape_in = emission_input_weights.shape
-            size_in = emission_input_weights.size
-            emission_input_weights_props = ParameterProperties(
-                trainable=True,
-                constrainer=tfb.Reshape(event_shape_out=shape_in, event_shape_in=(size_in,))
-                )
-            emission_input_weights_prior = observation_regression_weights_prior
-        else:
-            emission_input_weights = jnp.zeros((self.emission_dim, 0))
-            emission_input_weights_props = ParameterProperties(trainable=False)
-            emission_input_weights_prior = None
-        self.emission_bias = jnp.zeros(self.emission_dim)
-
-        # Parameters, their properties, and priors of the SSM model
-        self.params = {'dynamics_covariances': component_transition_covariances,
-                       'regression_weights': emission_input_weights}
-
-        self.param_props = {'dynamics_covariances': dynamics_covariance_props,
-                            'regression_weights': emission_input_weights_props}
-
-        self.priors = {'dynamics_covariances': component_transition_covariance_priors,
-                       'regression_weights': emission_input_weights_prior}
+                 params,
+                 param_props,
+                 param_priors,
+                 get_trans_mat,
+                 get_obs_mat,
+                 get_obs_cov):
+        self.params = params
+        self.param_props = param_props
+        self.param_priors = param_priors
+        self.get_trans_mat = get_trans_mat
+        self.get_obs_mat = get_obs_mat
+        self.get_obs_cov = get_obs_cov
 
     @property
     def emission_shape(self):
@@ -108,11 +69,9 @@ class _StructuralTimeSeriesSSM(SSM):
 
     def log_prior(self, params):
         lp = jnp.array([
-            cov_prior.log_prob(cov) for cov, cov_prior in zip(
-                params['dynamics_covariances'].values(), self.priors['dynamics_covariances'].values()
-                )]).sum()
-        if params['regression_weights'].size > 0:
-            lp += self.priors['regression_weights'].log_prob(params['regression_weights'])
+            c_prior.log_prob(param) for cov, cov_prior in zip(
+            params['dynamics_covariances'].values(), self.priors['dynamics_covariances'].values()
+            )]).sum()
         return lp
 
     # Instantiate distributions of the SSM model
@@ -458,21 +417,22 @@ class GaussianSSM(_StructuralTimeSeriesSSM):
         ts_covs = ts_mean_covs + self.params['emission_covariance']
         return ts_means, ts_covs, ts
 
+    @jit
     def _to_ssm_params(self, params):
         """Wrap the STS model into the form of the corresponding SSM model """
-        comp_cov = jsp.linalg.block_diag(*params['dynamics_covariances'].values())
-        spars_matrix = jsp.linalg.block_diag(*self.spars_matrix.values())
-        spars_cov = spars_matrix @ comp_cov @ spars_matrix.T
+        get_trans_mat = partial(self.get_trans_mat, params=params)
+        get_obs_mat = partial(self.get_obs_mat, params=params)
+        get_trans_cov = partial(self.get_obs_mat, params=params)
         obs_cov = params['emission_covariance']
         emission_input_weights = params['regression_weights']
         input_dim = emission_input_weights.shape[-1]
         return LGSSMParams(initial_mean=self.initial_mean,
                            initial_covariance=self.initial_covariance,
-                           dynamics_matrix=self.dynamics_matrix,
+                           dynamics_matrix=get_trans_mat,
                            dynamics_input_weights=jnp.zeros((self.state_dim, input_dim)),
                            dynamics_bias=self.dynamics_bias,
-                           dynamics_covariance=spars_cov,
-                           emission_matrix=self.emission_matrix,
+                           dynamics_covariance=get_trans_cov,
+                           emission_matrix=get_obs_mat,
                            emission_input_weights=emission_input_weights,
                            emission_bias=self.emission_bias,
                            emission_covariance=obs_cov)
@@ -534,6 +494,9 @@ class PoissonSSM(_StructuralTimeSeriesSSM):
 
     def _to_ssm_params(self, params):
         """Wrap the STS model into the form of the corresponding SSM model """
+        get_trans_mat = partial(self.get_trans_mat, params=params)
+        get_obs_mat = partial(self.get_obs_mat, params=params)
+        get_trans_cov = partial(self.get_obs_mat, params=params)
         comp_cov = jsp.linalg.block_diag(*params['dynamics_covariances'].values())
         spars_matrix = jsp.linalg.block_diag(*self.spars_matrix.values())
         spars_cov = spars_matrix @ comp_cov @ spars_matrix.T

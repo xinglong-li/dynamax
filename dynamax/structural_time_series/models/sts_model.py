@@ -1,12 +1,12 @@
-from abc import ABC
-from abc import abstractmethod
 from collections import OrderedDict
 import jax.numpy as jnp
 import jax.random as jr
+import jax.scipy as jsp
 from jax import vmap, jit
 from dynamax.distributions import InverseWishart as IW
 from dynamax.structural_time_series.models.structural_time_series_ssm import GaussianSSM, PoissonSSM
 import optax
+from sts_components import *
 
 
 class StructuralTimeSeries():
@@ -32,22 +32,76 @@ class StructuralTimeSeries():
 
     def __init__(self,
                  components,
-                 observed_time_series,
-                 observation_distribution_family='Gaussian',
-                 observation_covariance=None,
-                 observation_covariance_prior=None,
+                 obs_time_series,
+                 obs_distribution_family='Gaussian',
+                 obs_cov=None,
+                 obs_cov_props=None,
+                 obs_cov_prior=None,
                  name='sts_model'):
 
-        assert observation_distribution_family in ['Gaussian', 'Poisson']
+        names = [c.name for c in components]
+        assert len(set(names)) == len(names), "Components should not share the same name."
+        assert obs_distribution_family in ['Gaussian', 'Poisson'],\
+            "The distribution of observations must be Gaussian or Poisson."
 
-        # Initialize paramters
-        # Fit the regression model if has a component
+        self.obs_family = obs_distribution_family
+        self.name = name
+        self.dim_obs = obs_time_series.shape[-1]
+        self.params = OrderedDict()
 
-        # Initialize covs
+        # Initialize paramters using the scale of observed time series
+        obs_scale = jnp.std(jnp.abs(jnp.diff(observed_time_series, axis=0)), axis=0).mean()
+        for c in components:
+            if isinstance(c, LinearRegression):
+                residuals = c.fit()
+                obs_scale = jnp.std(jnp.abs(jnp.diff(residuals, axis=0)), axis=0).mean()
+        for c in components:
+            c.initialize_params(obs_scale)
 
-        self.params = None
-        self.params_props = None
-        self.priors = None
+        # Aggeragate components
+        self.params = OrderedDict()
+        self.param_props = OrderedDict()
+        self.priors = OrderedDict()
+        self.trans_mat_getters = OrderedDict()
+        self.obs_mat_getters = OrderedDict()
+        self.trans_cov_getters = OrderedDict()
+        for c in components.items:
+            self.params[c.name] = c.params
+            self.param_props[c.name] = c.param_props
+            self.priors[c.name] = c.param_props
+            self.trans_mat_getters[c.name] = c.get_trans_mat
+            self.obs_mat_getters[c.name] = c.get_obs_mat
+            self.trans_cov_getters[c.name] = c.get_trans_cov
+        self.params['obs_cov'] = obs_cov
+        self.param_props['obs_cov'] = obs_cov_props
+        self.priors['obs_cov'] = obs_cov_prior
+
+    @jit
+    def get_trans_mat(self, params, t):
+        trans_mat = []
+        for c_name, c_params in params:
+            trans_getter = self.trans_mat_getters[c_params]
+            c_trans_mat = trans_getter(c_params, t)
+            trans_mat.append(c_trans_mat)
+        return jsp.blockdiag(trans_mat)
+
+    @jit
+    def get_obs_mat(self, params, t):
+        obs_mat = []
+        for c_name, c_params in params:
+            obs_getter = self.obs_mat_getters[c_name]
+            c_obs_mat = obs_getter(c_params, t)
+            obs_mat.append(c_obs_mat)
+        return jnp.concatenate(obs_mat)
+
+    @jit
+    def get_trans_cov(self, params, t):
+        trans_cov = []
+        for c_name, c_params in params:
+            cov_getter = self.trans_cov_getters[c_params]
+            c_trans_cov = cov_getter(c_params, t)
+            trans_cov.append(c_trans_cov)
+        return jnp.blockdiag(trans_cov)
 
     def as_ssm(self):
         """Formulate the STS model as a linear Gaussian state space model:
@@ -62,7 +116,8 @@ class StructuralTimeSeries():
         if the STS model includes an regression component
         """
         if self.obs_family == 'Gaussian':
-            sts_ssm = GaussianSSM(self.get_trans_mat,
+            sts_ssm = GaussianSSM(self.params, self.param_props, self.priors,
+                                  self.get_trans_mat,
                                   self.get_obs_mat,
                                   self.initial_state_priors,
                                   self.get_trans_cov,
@@ -290,40 +345,3 @@ class StructuralTimeSeries():
             forecasts = vmap(single_forecast_poisson)(sts_params)
 
         return {'means': forecasts[0], 'covariances': forecasts[1], 'observations': forecasts[2]}
-
-
-class STSComponent(ABC):
-
-    @property
-    @abstractmethod
-    def get_trans_mat(self, t):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def get_obs_mat(self, t):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def get_trans_cov(self):
-        raise NotImplementedError
-
-
-
-
-
-    @property
-    @abstractmethod
-    def transition_covariance_prior(self):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def initial_state_prior(self):
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def cov_spars_matrix(self):
-        raise NotImplementedError
