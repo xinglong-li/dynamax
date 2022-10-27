@@ -179,47 +179,6 @@ class LocalLinearTrend(STSComponent):
         return jnp.eye(2*self.dim_obs)
 
 
-class Autoregressive(STSComponent):
-    def __init__(self, p, dim_obs=1, name='ar'):
-        super().__init__(name=name, dim_obs=dim_obs)
-
-        # 
-        self.initial_distribution = None
-        self.params = OrderedDict()
-        self.params['coef'] = None
-        self.params['noise_cov'] = None
-        self.param_props = OrderedDict()
-        self.priors = OrderedDict()
-
-        self._obs_mat = jnp.block(
-            [jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])
-
-    def initialize_params(self, obs_scale):
-        return
-
-    @jit
-    def get_trans_mat(self, cur_params, t):
-        phi = cur_params['coef']
-        order = len(phi)
-        if order > 1:
-            m = jnp.block([phi[:, None], jnp.vstack((jnp.eye(order-1), jnp.zeros((order-1, 1))))])
-        else:
-            m = phi[None, :]
-        return jnp.kron(m, jnp.eye(self.dim_obs))
-
-    @jit
-    def get_trans_cov(self, cur_params, t):
-        return self.params['noise_cov']
-
-    @property
-    def cov_select_mat(self):
-        raise NotImplementedError
-
-    @jit
-    def obs_mat(self):
-        return self._obs_mat
-
-
 class SeasonalDummy(STSComponent):
     """The (dummy) seasonal component of the structual time series (STS) model
     Since on average sum_{j=0}^{num_seasons-1}s_{t+1-j} = 0 for any t,
@@ -227,40 +186,34 @@ class SeasonalDummy(STSComponent):
 
     s_{t+1} = - sum_{j=1}^{num_seasons-1} s_{t+1-j} + N(0, drift_covariance)
 
-    Args:
-        num_seasons (int): number of seasons (assuming number of steps per season is 1)
+    Args (in addition to name and dim_obs):
+        num_seasons (int): number of seasons.
         num_steps_per_season:
-        drift_covariance_prior: InverseWishart prior for drift_covariance
-        initial_effect_prior: MultivariateNormal prior for initial_effect
-        observed_time_series: has shape (batch_size, timesteps, dim_observed_timeseries)
-        dim_observed_time_series: dimension of the observed time series
-        name (str): name of the component in the STS model
     """
 
-    def __init__(self,
-                 num_seasons,
-                 num_steps_per_season=1,
-                 dim_obs=1,
-                 name='seasonal_dummy'):
+    def __init__(self, num_seasons, num_steps_per_season=1, dim_obs=1, name='seasonal_dummy'):
         super().__init__(name=name, dim_obs=dim_obs)
 
-        self.initial_distribution = None
+        self.initial_distribution = MVN(jnp.zeros(num_seasons*dim_obs), jnp.eye(num_seasons*dim_obs))
         self.steps_per_season = num_steps_per_season
 
-        self.params['drift_cov'] = None
         self.param_props['drift_cov'] = None
         self.priors['drift_cov'] = None
+        self.params['drift_cov'] = self.priors['drift_cov'].mode()
 
+        # The 
         self._trans_mat = jnp.block(
             [[jnp.kron(-jnp.ones(self.num_seasons-1), jnp.eye(self.dim_obs))],
              [jnp.eye((self.num_seasons-2)*self.dim_obs),
               jnp.zeros(((self.num_seasons-2)*self.dim_obs, self.dim_obs))]])
 
+        # Fixed 
+
     def initialize_params(self, obs_scale):
         raise NotImplementedError
 
     @jit
-    def get_trans_mat(self, cur_params, t):
+    def get_trans_mat(self, params, t):
         update = t % self.steps_per_season == 0
         if update:
             return self.trans_mat
@@ -268,7 +221,7 @@ class SeasonalDummy(STSComponent):
             return jnp.eye(self.dim_obs)
 
     @jit
-    def get_trans_cov(self, cur_params, t):
+    def get_trans_cov(self, params, t):
         update = t % self.steps_per_season == 0
         if update:
             return params['drift_cov']
@@ -299,18 +252,9 @@ class SeasonalTrig(STSComponent):
     Args:
         num_seasons (int): number of seasons (assuming number of steps per season is 1)
         num_steps_per_season:
-        drift_variance_prior: InverseWishart prior for drift_covariance
-        initial_effect_prior: MultivariateNormal prior for initial_effect
-        observed_time_series: has shape (batch_size, timesteps, dim_observed_timeseries)
-        dim_observed_time_series: dimension of the observed time series
-        name (str): name of the component in the STS model
     """
 
-    def __init__(self,
-                 num_seasons,
-                 num_steps_per_season=1,
-                 dim_obs=1,
-                 name='seasonal_trig'):
+    def __init__(self, num_seasons, num_steps_per_season=1, dim_obs=1, name='seasonal_trig'):
         super().__init__(name=name, dim_obs=dim_obs)
 
         self.initial_distribution = None
@@ -438,3 +382,44 @@ class LinearRegression(STSRegression):
             return params['weights'] @ jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)))
         else:
             return params['weights'] @ covariates
+
+
+class Autoregressive(STSComponent):
+    def __init__(self, p, dim_obs=1, name='ar'):
+        super().__init__(name=name, dim_obs=dim_obs)
+
+        # 
+        self.initial_distribution = None
+        self.params = OrderedDict()
+        self.params['coef'] = None
+        self.params['noise_cov'] = None
+        self.param_props = OrderedDict()
+        self.priors = OrderedDict()
+
+        self._obs_mat = jnp.block(
+            [jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])
+
+    def initialize_params(self, obs_scale):
+        return
+
+    @jit
+    def get_trans_mat(self, cur_params, t):
+        phi = cur_params['coef']
+        order = len(phi)
+        if order > 1:
+            m = jnp.block([phi[:, None], jnp.vstack((jnp.eye(order-1), jnp.zeros((order-1, 1))))])
+        else:
+            m = phi[None, :]
+        return jnp.kron(m, jnp.eye(self.dim_obs))
+
+    @jit
+    def get_trans_cov(self, cur_params, t):
+        return self.params['noise_cov']
+
+    @property
+    def cov_select_mat(self):
+        raise NotImplementedError
+
+    @jit
+    def obs_mat(self):
+        return self._obs_mat
