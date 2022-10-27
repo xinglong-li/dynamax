@@ -33,12 +33,13 @@ class STSComponent(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_obs_mat(self, cur_params, t):
-        raise NotImplementedError
-
-    @abstractmethod
     def get_trans_cov(self, cur_params, t):
         """Nonsingular covariance matrix"""
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def obs_mat(self):
         raise NotImplementedError
 
     @property
@@ -78,7 +79,7 @@ class LocalLinearTrend(STSComponent):
         self.params['cov_level'] = None
         self.param_props['cov_level'] = None
         self.priors['cov_level'] = None
-        
+
         self.params['cov_slope'] = None
         self.param_props['cov_slope'] = None
         self.priors['cov_slope'] = None
@@ -92,13 +93,13 @@ class LocalLinearTrend(STSComponent):
                           [jnp.zeros((self.dim_obs, self.dim_obs)), jnp.eye(self.dim_obs)]])
 
     @jit
-    def get_obs_mat(self, cur_params, t):
-        return jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))])
-
-    @jit
     def get_trans_cov(self, cur_params, t):
         return jnp.block([[cur_params['cov_level'], jnp.zeros((self.dim_obs, self.dim_obs))],
                           [jnp.zeros((self.dim_obs, self.dim_obs)), cur_params['cov_slope']]])
+
+    @jit
+    def obs_mat(self):
+        return jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))])
 
     @property
     def cov_select_mat(self):
@@ -112,30 +113,38 @@ class Autoregressive(STSComponent):
         self.initial_distribution = None
 
         self.params = OrderedDict()
+        self.params['coef'] = None
+        self.params['noise_cov'] = None
         self.param_props = OrderedDict()
         self.priors = OrderedDict()
 
         self._obs_mat = jnp.block(
             [jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])
-    
+
     def initialize_params(self, obs_scale):
-        return
-    
-    @jit
-    def get_trans_mat(self, cur_params, t):
         return
 
     @jit
-    def get_obs_mat(self, cur_params, t):
-        return self.obs_mat
+    def get_trans_mat(self, cur_params, t):
+        phi = cur_params['coef']
+        order = len(phi)
+        if order > 1:
+            m = jnp.block([phi[:, None], jnp.vstack((jnp.eye(order-1), jnp.zeros((order-1, 1))))])
+        else:
+            m = phi[None,:]
+        return jnp.kron(m, jnp.eye(self.dim_obs))
 
     @jit
     def get_trans_cov(self, cur_params, t):
-        return
+        return self.params['noise_cov']
 
     @property
     def cov_select_mat(self):
         raise NotImplementedError
+
+    @jit
+    def obs_mat(self):
+        return self._obs_mat
 
 
 class SeasonalDummy(STSComponent):
@@ -173,8 +182,6 @@ class SeasonalDummy(STSComponent):
             [[jnp.kron(-jnp.ones(self.num_seasons-1), jnp.eye(self.dim_obs))],
              [jnp.eye((self.num_seasons-2)*self.dim_obs),
               jnp.zeros(((self.num_seasons-2)*self.dim_obs, self.dim_obs))]])
-        self._obs_mat = jnp.block(
-            [jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])
 
     def initialize_params(self, obs_scale):
         raise NotImplementedError
@@ -188,16 +195,17 @@ class SeasonalDummy(STSComponent):
             return jnp.eye(self.dim_obs)
 
     @jit
-    def get_obs_mat(self, cur_params, t):
-        return self.obs_mat
-
-    @jit
     def get_trans_cov(self, cur_params, t):
         update = t % self.steps_per_season == 0
         if update:
             return params['drift_cov']
         else:
             return jnp.zeros((self.dim_obs, self.dim_obs))
+
+    @jit
+    def obs_mat(self):
+        return jnp.block(
+            [jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])
 
     @property
     def cov_select_mat(self):
@@ -257,17 +265,17 @@ class SeasonalTrig(STSComponent):
         return {self.component_name: matrix}
 
     @jit
-    def get_obs_mat(self, cur_params, t):
+    def get_trans_cov(self, params, t):
+        return jnp.kron(jnp.eye(self.num_seasons-1), params['drift_cov'])
+
+    @jit
+    def obs_mat(self):
         num_pairs = int(jnp.floor(self.num_seasons/2.))
         matrix = jnp.tile(
             jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))]), num_pairs)
         if self.num_seasons % 2 == 0:
             matrix = matrix[:-self.dim_obs, :]
         return matrix
-
-    @jit
-    def get_trans_cov(self, params, t):
-        return jnp.kron(jnp.eye(self.num_seasons-1), params['drift_cov'])
 
     @property
     def cov_select_mat(self):
@@ -316,63 +324,44 @@ class Cycle(STSComponent):
                           [-damp*sin_fr, damp*cos_fr]])
 
     @jit
-    def get_obs_mat(self):
-        return jnp.block([jnp.eye(self.dim_obs), jnp.zeros(self.dim_obs, self.dim_obs)])
-
-    @jit
     def get_trans_cov(self):
         Q = self.params['cov']
         return jnp.block([[Q, jnp.zeros_like(Q)],
                           [jnp.zeros_like(Q), Q]])
 
+    @jit
+    def obs_mat(self):
+        return jnp.block([jnp.eye(self.dim_obs), jnp.zeros(self.dim_obs, self.dim_obs)])
+
     @property
     def cov_select_mat(self):
         raise NotImplementedError
 
 
-class LinearRegression(STSComponent):
+class LinearRegression():
     """The linear regression component of the structural time series model.
 
     Args:
         STSComponent (_type_): _description_
     """
-    def __init__(self, covariates, add_bias_term=True, dim_obs=1, name='linear_regression'):
-        super().__init__()
-        
-        if add_bias_term:
-            self.inputs = jnp.concatenate((covariates, jnp.ones((len(covariates), 1))), axis=1)
-        else:
-            self.inputs = covariates
-        dim_inputs = self.inputs.shape[-1]
-        
-        self.initial_distribution = None
+    def __init__(self, dim_covariates, add_bias=True, dim_obs=1, name='linear_regression'):
+
+        self.add_bias = add_bias
+
+        dim_inputs = dim_covariates + 1 if add_bias else dim_covariates
 
         self.params['weights'] = jnp.zeros((dim_inputs, dim_obs))
         self.param_props['weights'] = None
-        self.param_props['weights'] = None
+        self.priors['weights'] = None
 
-    def initialize_params(self):
-        W = jnp.solve(c.inputs.T @ c.inputs, c.inputs.T @ observed_time_series)
-            c.params['weights'] = W
-        residuals = observed_time_series - c.inputs @ W.T
-        return residuals
+    def initialize(self, covariates, obs_time_series):
+        if self.add_bias:
+            inputs = jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)), axis=0)
+        W = jnp.solve(inputs.T @ inputs, inputs.T @ observed_time_series)
+        self.params['weights'] = W
 
-    @jit
-    def get_trans_mat(self, cur_params, t):
-        return jnp.eye(self.dim_obs)
-
-    @jit
-    def get_obs_mat(self, cur_params, t):
-        # Set the emission matrix to be the fitted value of the regression model,
-        # since we set the latent state for the regression term to be a vector of 1s.
-        fitted_value = cur_params['weights'] @ self.inputs[t]
-        return jnp.diag(fitted_value)
-
-    @jit
-    def get_trans_cov(self, cur_params, t):
-        # The regression component does not have a noise term
-        return jnp.zeros((self.dim_obs, self.dim_obs))
-
-    @property
-    def cov_select_mat(self):
-        raise NotImplementedError
+    def fitted_values(self, params, covariates):
+        if self.add_bias:
+            return params['weights'] @ jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)))
+        else:
+            return params['weights'] @ covariates

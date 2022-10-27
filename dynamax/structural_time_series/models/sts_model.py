@@ -44,15 +44,15 @@ class StructuralTimeSeries():
         assert obs_distribution_family in ['Gaussian', 'Poisson'],\
             "The distribution of observations must be Gaussian or Poisson."
 
-        self.obs_family = obs_distribution_family
         self.name = name
-        self.dim_obs = obs_time_series.shape[-1]
-        self.params = OrderedDict()
+        self.obs_family = obs_distribution_family
 
         # Initialize paramters using the scale of observed time series
-        obs_scale = jnp.std(jnp.abs(jnp.diff(observed_time_series, axis=0)), axis=0).mean()
+        regression_term = None
+        obs_scale = jnp.std(jnp.abs(jnp.diff(obs_time_series, axis=0)), axis=0).mean()
         for c in components:
             if isinstance(c, LinearRegression):
+                regression_term = c
                 residuals = c.fit()
                 obs_scale = jnp.std(jnp.abs(jnp.diff(residuals, axis=0)), axis=0).mean()
         for c in components:
@@ -67,18 +67,23 @@ class StructuralTimeSeries():
         self.obs_mat_getters = OrderedDict()
         self.trans_cov_getters = OrderedDict()
 
-        for c in components.items:
-            self.initial_distributions[c.name](c.initial_distribution)
-            self.params[c.name] = c.params
-            self.param_props[c.name] = c.param_props
-            self.priors[c.name] = c.param_props
-            self.trans_mat_getters[c.name] = c.get_trans_mat
-            self.obs_mat_getters[c.name] = c.get_obs_mat
-            self.trans_cov_getters[c.name] = c.get_trans_cov
-
+        for c in components:
+            if not isinstance(c, LinearRegression):
+                self.initial_distributions[c.name](c.initial_distribution)
+                self.params[c.name] = c.params
+                self.param_props[c.name] = c.param_props
+                self.priors[c.name] = c.param_props
+                self.trans_mat_getters[c.name] = c.get_trans_mat
+                self.obs_mat_getters[c.name] = c.get_obs_mat
+                self.trans_cov_getters[c.name] = c.get_trans_cov
         self.params['obs_cov'] = obs_cov
         self.param_props['obs_cov'] = obs_cov_props
         self.priors['obs_cov'] = obs_cov_prior
+        # Always put the regression term at the end if there is one!
+        if regression_term is not None:
+            self.params[c.name] = c.params
+            self.param_props[c.name] = c.param_props
+            self.priors[c.name] = c.param_props
 
     def as_ssm(self):
         """Formulate the STS model as a linear Gaussian state space model:
@@ -266,13 +271,6 @@ class StructuralTimeSeries():
             key=key, inputs=inputs, optimizer=optimizer)
 
         return optimal_params, losses
-
-    def fit_vi(self, key, sample_size, observed_time_series, inputs=None, M=100):
-        """Sample parameters of the STS model from the approximate distribution fitted by ADVI.
-        """
-        sts_ssm = self.as_ssm()
-        param_samps = sts_ssm.fit_vi(key, sample_size, observed_time_series, inputs, M)
-        return param_samps
 
     def forecast(self, key, observed_time_series, sts_params, num_forecast_steps,
                  past_inputs=None, forecast_inputs=None):

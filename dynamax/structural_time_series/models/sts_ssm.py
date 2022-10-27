@@ -31,6 +31,7 @@ from tensorflow_probability.substrates.jax.distributions import (
     MultivariateNormalDiag as MVNDiag,
     Poisson)
 from tqdm.auto import trange
+from dynamax.utils import pytree_stack, ensure_array_has_batch_dim
 
 
 class _StructuralTimeSeriesSSM(SSM):
@@ -57,7 +58,8 @@ class _StructuralTimeSeriesSSM(SSM):
                  obs_mat_getters,
                  trans_cov_getters,
                  initial_distributions,
-                 cov_select_mat):
+                 cov_select_mat,
+                 regression_comp):
         self.params = params
         self.param_props = param_props
         self.param_priors = priors
@@ -68,6 +70,9 @@ class _StructuralTimeSeriesSSM(SSM):
         self.trans_mat_getters = OrderedDict()
         self.obs_mat_getters = OrderedDict()
         self.trans_cov_getters = OrderedDict()
+
+        self.dim_obs = None
+        self.regression = None
 
     @property
     def emission_shape(self):
@@ -82,7 +87,7 @@ class _StructuralTimeSeriesSSM(SSM):
         """Distribution of the initial state of the SSM model.
         Not implement because some component has 0 covariances.
         """
-        raise NotImplementedError
+        return self.initial_state_distribution
 
     def transition_distribution(self, state):
         """Not implemented because tfp.distribution does not allow
@@ -90,229 +95,187 @@ class _StructuralTimeSeriesSSM(SSM):
         """
         raise NotImplementedError
 
-    def emission_distribution(self, state):
+    def emission_distribution(self, state, covariates=None):
         """Depends on the distribution family of the observation.
         """
         raise NotImplementedError
 
     @jit
-    def sample(self, params, key, num_timesteps):
+    def sample(self, params, key, num_timesteps, covariates=None):
         """Sample a sequence of latent states and emissions with the given parameters.
 
         Since the regression is contained in the regression component,
         so there is no covariates term under the STS framework.
         """
-        initial_dists = self.component_init_dists
-        get_trans_mat = partial(self.get_trans_mat, params=params)
-        get_trans_cov = partial(self.get_trans_cov, params=params)
+        if covariates is not None:
+            inputs = self.regression(params[-1], covariates)
+            get_trans_mat = partial(self.get_trans_mat, params=params[:-1])
+            get_trans_cov = partial(self.get_trans_cov, params=params[:-1])
+        else:
+            inputs = jnp.zeros((num_timesteps, self.dim_obs))
+            get_trans_mat = partial(self.get_trans_mat, params=params)
+            get_trans_cov = partial(self.get_trans_cov, params=params)
         cov_select_mat = self.cov_select_mat
         dim_comp = get_trans_cov(0).shape[-1]
 
         def _step(prev_state, args):
-            key, t = args
+            key, input, t = args
             key1, key2 = jr.split(key, 2)
             next_state = get_trans_mat(t) @ prev_state
             next_state = next_state + cov_select_mat @ MVN(jnp.zeros(dim_comp),
                                                            get_trans_cov(t)).sample(seed=key1)
-            emission = self.emission_distribution(prev_state).sample(seed=key2)
+            emission = self.emission_distribution(prev_state, input).sample(seed=key2)
             return next_state, (prev_state, emission)
 
         # Sample the initial state
-        key1, key2 = jr.split(key, 2)
-        key1s = jr.split(key1, len(initial_dists))
-        initial_state = jnp.concatenate([c_dist.sample(seed=key)
-                                         for c_dist, key in (initial_dists, key1s)])
+        key1, key2, key = jr.split(key, 3)
+        initial_state = self.initial_distribution().sample(seed=key1)
+        initial_emission = self.emission_distribution(initial_state, inputs[0]).sample(seed=key2)
 
         # Sample the remaining emissions and states
         key2s = jr.split(key2, num_timesteps)
-        _, (states, emissions) = lax.scan(_step, initial_state, (key2s, jnp.arange(num_timesteps)))
-
+        _, (states, emissions) = lax.scan(_step,
+                                          initial_state,
+                                          (key2s, inputs, jnp.arange(num_timesteps)))
         return states, emissions
 
     @jit
-    def marginal_log_prob(self, params, obs_time_series):
+    def marginal_log_prob(self, params, obs_time_series, covariates=None):
         """Compute log marginal likelihood of observations."""
-        ssm_params = self._to_ssm_params(params)
-        filtered_posterior = self._ssm_filter(params=ssm_params, emissions=obs_time_series)
+        if covariates is not None:
+            inputs = self.regression(params[-1], covariates)
+            ssm_params = self._to_ssm_params(params[:-1])
+        else:
+            inputs = jnp.zeros(obs_time_series.shape)
+            ssm_params = self._to_ssm_params(params)
+        filtered_posterior = self._ssm_filter(
+            params=ssm_params, emissions=obs_time_series, inputs=inputs)
         return filtered_posterior.marginal_loglik
 
     @jit
-    def posterior_sample(self, params, key, obs_time_series):
+    def posterior_sample(self, params, key, obs_time_series, covariates=None):
+        if covariates is not None:
+            inputs = self.regression(params[-1], covariates)
+            ssm_params = self._to_ssm_params(params[:-1])
+        else:
+            inputs = jnp.zeros(obs_time_series.shape)
+            ssm_params = self._to_ssm_params(params)
+
         key1, key2 = jr.split(key, 2)
         num_timesteps, dim_obs = obs_time_series.shape
+
         ssm_params = self._to_ssm_params(params)
+
         obs_mats = vmap(self.get_obs_mat, (None, 0))(params, jnp.arange(num_timesteps))
 
         ll, states = self._ssm_posterior_sample(key1, ssm_params, obs_time_series)
-        obs_means = vmap(jnp.matmul)(obs_mats, obs_time_series)
-        obs_means = self._emission_constrainer(obs_means)
+        unc_obs_means = vmap(jnp.matmul)(obs_mats, states) + inputs
+        obs_means = self._emission_constrainer(unc_obs_means)
         key2s = jr.split(key2, num_timesteps)
-        emission_sampler = lambda state, key: self.emission_distribution(state).sample(seed=key)
-        obs = vmap(emission_sampler)(states, key2s)
+        emission_sampler = lambda state, input, key:\
+            self.emission_distribution(state, input).sample(seed=key)
+        obs = vmap(emission_sampler)(states, inputs, key2s)
         return obs_means, obs
 
-    def component_posterior(self, obs_time_series):
+    def component_posterior(self, params, obs_time_series, covariates=None):
         """Smoothing by component
         """
+        num_timesteps, dim_obs = obs_time_series.shape
         # Compute the posterior of the joint SSM model
+        if covariates is not None:
+            inputs = self.regression(params[-1], covariates)
+            ssm_params = self._to_ssm_params(params[:-1])
+        else:
+            inputs = jnp.zeros(obs_time_series.shape)
+            ssm_params = self._to_ssm_params(params)
         component_pos = OrderedDict()
-        ssm_params = self._to_ssm_params(self.params)
-        pos = self._ssm_smoother(ssm_params, obs_time_series)
+        pos = self._ssm_smoother(ssm_params, obs_time_series, inputs)
         mu_pos = pos.smoothed_means
         var_pos = pos.smoothed_covariances
+        obs_mats = vmap(self.get_obs_mat, (None, 0))(params, jnp.arange(num_timesteps))
 
         # Decompose by component
         _loc = 0
-        for c, emission_matrix in self.component_emission_matrices.items():
-            c_dim = emission_matrix.shape[-1]
-            c_mu = mu_pos[:, _loc:_loc+c_dim]
-            c_var = var_pos[:, _loc:_loc+c_dim, _loc:_loc+c_dim]
-            c_emission_mu = vmap(lambda s, m: m @ s, (0, None))(c_mu, emission_matrix)
-            c_emission_constrained_mu = self._emission_constrainer(c_emission_mu)
-            c_emission_var = vmap(lambda s, m: m @ s @ m.T, (0, None))(c_var, emission_matrix)
-            component_pos[c] = (c_emission_constrained_mu, c_emission_var)
+        for c, get_obs_mat in self.obs_mat_getters.items():
+            obs_mats = vmap(get_obs_mat, (None, 0))(params[c], jnp.arange(num_timesteps))
+            c_dim = obs_mats.shape[-1]
+            c_mean = mu_pos[:, _loc:_loc+c_dim]
+            c_cov = var_pos[:, _loc:_loc+c_dim, _loc:_loc+c_dim]
+            c_obs_mean = vmap(jnp.matmul)(obs_mats, c_mean)
+            c_obs_constrained_mean = self._emission_constrainer(c_obs_mean)
+            c_obs_cov = vmap(lambda s, m: m @ s @ m.T)(c_cov, obs_mats)
+            component_pos[c] = (c_obs_constrained_mean, c_obs_cov)
             _loc += c_dim
-
         return component_pos
 
     def fit_hmc(self,
+                initial_params,
+                param_props,
                 key,
-                sample_size,
+                num_samples,
                 emissions,
-                inputs=None,
-                warmup_steps=500,
-                num_integration_steps=20):
+                covariates=None,
+                warmup_steps=100,
+                num_integration_steps=30,
+                verbose=True):
+        """Sample parameters of the model using HMC."""
+        # Make sure the emissions and covariates have batch dimensions
+        batch_emissions = ensure_array_has_batch_dim(emissions, self.emission_shape)
+        batch_covariates = ensure_array_has_batch_dim(covariates, self.covariates_shape)
 
-        def unnorm_log_pos(trainable_unc_params):
-            params = from_unconstrained(trainable_unc_params, fixed_params, self.param_props)
-            log_det_jac = log_det_jac_constrain(trainable_unc_params, fixed_params, self.param_props)
+        initial_unc_params, fixed_params = to_unconstrained(initial_params, param_props)
+
+        # The log likelihood that the HMC samples from
+        def unnorm_log_pos(_unc_params):
+            params = from_unconstrained(_unc_params, fixed_params, self.param_props)
+            log_det_jac = log_det_jac_constrain(_unc_params, fixed_params, self.param_props)
             log_pri = self.log_prior(params) + log_det_jac
-            batch_lls = self.marginal_log_prob(params, emissions, inputs)
+            batch_lls = vmap(partial(self.marginal_log_prob, params))(batch_emissions, batch_covariates)
             lp = log_pri + batch_lls.sum()
             return lp
 
         # Initialize the HMC sampler using window_adaptations
         hmc_initial_position, fixed_params = to_unconstrained(self.params, self.param_props)
-        warmup = blackjax.window_adaptation(blackjax.hmc,
-                                            unnorm_log_pos,
-                                            num_steps=warmup_steps,
-                                            num_integration_steps=num_integration_steps)
-        hmc_initial_state, hmc_kernel, _ = warmup.run(key, hmc_initial_position)
+        warmup = blackjax.window_adaptation(blackjax.nuts, unnorm_log_pos, num_steps=warmup_steps)
+        init_key, key = jr.split(key)
+        hmc_initial_state, hmc_kernel, _ = warmup.run(init_key, initial_unc_params)
 
         @jit
-        def _step(current_state, rng_key):
-            next_state, _ = hmc_kernel(rng_key, current_state)
-            unc_sample = next_state.position
-            return next_state, unc_sample
+        def hmc_step(hmc_state, step_key):
+            next_hmc_state, _ = hmc_kernel(step_key, hmc_state)
+            params = from_unconstrained(hmc_state.position, fixed_params, param_props)
+            return next_hmc_state, params
 
-        keys = iter(jr.split(key, sample_size))
-        param_samples = []
-        current_state = hmc_initial_state
-        for _ in trange(sample_size):
-            current_state, unc_sample = _step(current_state, next(keys))
-            sample = from_unconstrained(unc_sample, fixed_params, self.param_props)
-            param_samples.append(sample)
+        # Start sampling
+        log_probs = []
+        samples = []
+        hmc_state = hmc_initial_state
+        pbar = trange(num_samples) if verbose else range(num_samples)
+        for _ in pbar:
+            step_key, key = jr.split(key)
+            hmc_state, params = hmc_step(hmc_state, step_key)
+            log_probs.append(-hmc_state.potential_energy)
+            samples.append(params)
 
-        param_samples = tree_map(lambda x, *y: jnp.array([x] + [i for i in y]),
-                                 param_samples[0], *param_samples[1:])
-        return param_samples
+        # Combine the samples into a single pytree
+        return pytree_stack(samples), jnp.array(log_probs)
 
-    def fit_vi(self, key, sample_size, emissions, inputs=None, M=100):
-        """
-        ADVI approximate the posterior distribtuion p of unconstrained global parameters
-        with factorized multivatriate normal distribution:
-        q = \prod_{k=1}^{K} q_k(mu_k, sigma_k),
-        where K is dimension of p.
-
-        The hyper-parameters of q to be optimized over are (mu_k, log_sigma_k))_{k=1}^{K}.
-
-        The trick of reparameterization is employed to reduce the variance of SGD,
-        which is achieved by written KL(q || p) as expectation over standard normal distribution
-        so a sample from q is obstained by
-        s = z * exp(log_sigma_k) + mu_k,
-        where z is a sample from the standard multivarate normal distribtion.
-
-        This implementation of ADVI uses fixed samples from q during fitting, instead of
-        updating samples from q in each iteration, as in SGD.
-        So the second order fixed optimization algorithm L-BFGS is used.
-
-        Args:
-            sample_size (int): number of samples to be returned from the fitted approxiamtion q.
-            M (int): number of fixed samples from q used in evaluation of ELBO.
-
-        Returns:
-            Samples from the approximate posterior q
-        """
-        key0, key1 = jr.split(key)
-        model_unc_params, fixed_params = to_unconstrained(self.params, self.param_props)
-        params_flat, params_structure = flatten(model_unc_params)
-        vi_dim = len(params_flat)
-
-        std_normal = MVNDiag(jnp.zeros(vi_dim), jnp.ones(vi_dim))
-        std_samples = std_normal.sample(seed=key0, sample_shape=(M,))
-        std_samples = vmap(unflatten, (None, 0))(params_structure, std_samples)
-
-        @jit
-        def unnorm_log_pos(unc_params):
-            """Unnormalzied log posterior of global parameters."""
-
-            params = from_unconstrained(unc_params, fixed_params, self.param_props)
-            log_det_jac = log_det_jac_constrain(unc_params, fixed_params, self.param_props)
-            log_pri = self.log_prior(params) + log_det_jac
-            batch_lls = self.marginal_log_prob(params, emissions, inputs)
-            lp = log_pri + batch_lls.sum()
-            return lp
-
-        @jit
-        def _samp_elbo(vi_params, std_samp):
-            """Evaluate ELBO at one sample from the approximate distribution q.
-            """
-            vi_means, vi_log_sigmas = vi_params
-            # unc_params_flat = vi_means + std_samp * jnp.exp(vi_log_sigmas)
-            # unc_params = unflatten(params_structure, unc_params_flat)
-            # With reparameterization, entropy of q evaluated at z is
-            # sum(hyper_log_sigma) plus some constant depending only on z.
-            _params = tree_map(lambda x, log_sig: x * jnp.exp(log_sig), std_samp, vi_log_sigmas)
-            unc_params = tree_map(lambda x, mu: x + mu, _params, vi_means)
-            q_entropy = flatten(vi_log_sigmas)[0].sum()
-            return q_entropy + unnorm_log_pos(unc_params)
-
-        objective = lambda x: -vmap(_samp_elbo, (None, 0))(x, std_samples).mean()
-
-        # Fit ADVI with LBFGS algorithm
-        initial_vi_means = model_unc_params
-        initial_vi_log_sigmas = unflatten(params_structure, jnp.zeros(vi_dim))
-        initial_vi_params = (initial_vi_means, initial_vi_log_sigmas)
-        lbfgs = LBFGS(maxiter=1000, fun=objective, tol=1e-3, stepsize=1e-3, jit=True)
-        (vi_means, vi_log_sigmas), _info = lbfgs.run(initial_vi_params)
-
-        # Sample from the learned approximate posterior q
-        _samples = std_normal.sample(seed=key1, sample_shape=(sample_size,))
-        _vi_means = flatten(vi_means)[0]
-        _vi_log_sigmas = flatten(vi_log_sigmas)[0]
-        vi_samples_flat = _vi_means + _samples * jnp.exp(_vi_log_sigmas)
-        vi_unc_samples = vmap(unflatten, (None, 0))(params_structure, vi_samples_flat)
-        vi_samples = vmap(from_unconstrained, (0, None, None))(
-            vi_unc_samples, fixed_params, self.param_props)
-
-        return vi_samples
-
-    def forecast(self, key, observed_time_series, num_forecast_steps,
-                 past_inputs=None, forecast_inputs=None):
+    def forecast(self, key, params, obs_time_series, num_forecast_steps,
+                 past_covariates=None, forecast_covariates=None):
         """Forecast the time series"""
 
-        if forecast_inputs is None:
-            forecast_inputs = jnp.zeros((num_forecast_steps, 0))
-        weights = self.params['regression_weights']
-        comp_cov = jsp.linalg.block_diag(*self.params['dynamics_covariances'].values())
-        spars_matrix = jsp.linalg.block_diag(*self.spars_matrix.values())
-        spars_cov = spars_matrix @ comp_cov @ spars_matrix.T
-        dim_comp = comp_cov.shape[-1]
+        if forecast_covariates is not None:
+            past_inputs = self.regression(params[-1], past_covariates)
+            forecast_inputs = self.regression(params[-1], forecast_covariates)
+            ssm_params = self._to_ssm_params(params[:-1])
+        else:
+            past_inputs = jnp.zeros(obs_time_series.shape)
+            forecast_inputs = jnp.zeros((num_forecast_steps, self.dim_obs))
+            ssm_params = self._to_ssm_params(params)
 
         # Filtering the observed time series to initialize the forecast
-        ssm_params = self._to_ssm_params(self.params)
         filtered_posterior = self._ssm_filter(params=ssm_params,
-                                              emissions=observed_time_series,
+                                              emissions=obs_time_series,
                                               inputs=past_inputs)
         filtered_mean = filtered_posterior.filtered_means
         filtered_cov = filtered_posterior.filtered_covariances
