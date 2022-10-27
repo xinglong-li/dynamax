@@ -413,7 +413,7 @@ class SeasonalTrig(STSComponent):
 
 
 class LinearRegression(STSRegression):
-    """The linear regression component of the structural time series model.
+    """The linear regression component of the structural time series (STS) model.
 
     The parameter of the linear regression function is the coefficient matrix W.
     The shape of W is (dim_obs, dim_covariates) if no bias term is added, and is
@@ -504,10 +504,14 @@ class Cycle(STSComponent):
 
 
 class Autoregressive(STSComponent):
+    """The autoregressive component of the structural time series (STS) model.
+
+    Args:
+
+    """
     def __init__(self, p, dim_obs=1, name='ar'):
         super().__init__(name=name, dim_obs=dim_obs)
 
-        # 
         self.initial_distribution = None
         self.params = OrderedDict()
         self.params['coef'] = None
