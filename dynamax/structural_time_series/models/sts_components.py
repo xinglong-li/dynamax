@@ -20,7 +20,7 @@ RealToPSD = tfb.Invert(PSDToRealBijector)
 class STSComponent(ABC):
     """Meta class of latent component of structural time series (STS) models.
 
-    A latent component of the STS model has following arributes:
+    A latent component of the STS model has following attributes:
 
     name (string): name of the latend component.
     dim_obs (int): dimension of the observation in each step of the observed time series.
@@ -70,7 +70,7 @@ class STSComponent(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_trans_cov(self, params):
+    def get_trans_cov(self, params, t):
         """Nonsingular covariance matrix"""
         raise NotImplementedError
 
@@ -89,8 +89,20 @@ class STSComponent(ABC):
 class STSRegression(ABC):
     """Meta class of regression component of structural time series (STS) models.
 
-    Args:
-        ABC (_type_): _description_
+    The regression component has the same dimension as the observed time series.
+    This component will appear in the observation (emission) model in the state space model
+    form of the STS, since it does not have the random term, in contrast to latent components.
+
+    A regression component of the STS model has following attributes:
+
+    name (string): name of the regression component.
+    dim_obs (int): dimension of the observation in each step of the observed time series.
+        This is also the output of the regression model.
+    params (OrderedDict): parameters of the function need to be learned in model fitting.
+    param_props (OrderedDict): properties of each item in 'params'.
+        Each item is an instance of ParameterProperties, which specifies constrainer
+        of the parameter and whether the parameter is trainable.
+    priors (OrderedDict): prior distributions for each item in 'params'.
     """
 
     def __init__(self, name, dim_obs=1):
@@ -103,10 +115,31 @@ class STSRegression(ABC):
 
     @abstractmethod
     def initialize(self, covariates, obs_time_series):
+        """Initialize parameters of the regression function by minimising the least square error,
+        given the series of covariates and the observed time series.
+
+        Args:
+            covariates (len(obs_time_series), dim_covariates): series of inputs
+                of the regression function.
+            obs_time_series: observed time series.
+        Returns:
+            No returns. Change self.params and self.initial_distributions directly.
+        """
         raise NotImplementedError
 
     @abstractmethod
     def fitted_values(self, params, covariates):
+        """Compute the fitted value of the regression model at one time step
+            given parameters and covariates.
+
+        Args:
+            params (OrderedDict): parameters based on which the regression model
+                is to be evalueated. Has the same tree structure with self.params.
+            covariates (dim_cov, ): covariates at which the regression model is to be evaluated
+
+        Raises:
+            fitted (dim_obs,): the fitted value of the regression model.
+        """
         raise NotImplementedError
 
 
@@ -118,15 +151,15 @@ class STSRegression(ABC):
 class LocalLinearTrend(STSComponent):
     """The local linear trend component of the structual time series (STS) model
 
-    The latent state is [level, slope], and the dynamics is
+    The latent state is [level, slope], having dimension 2 * dim_obs. The dynamics is
 
-    level[t+1] = level[t] + slope[t] + N(0, cov_level)
-    slope[t+1] = slope[t] + N(0, cov_slope)
+        level[t+1] = level[t] + slope[t] + N(0, cov_level)
+        slope[t+1] = slope[t] + N(0, cov_slope)
 
-    In the observed time series is in 1-d:
+    In the case dim_obs = 1:
 
-    trans_mat = | 1, 1 |    obs_mat = | 1, 0 |
-                | 0, 1 |,
+        trans_mat = | 1, 1 |    obs_mat = [ 1, 0 ]
+                    | 0, 1 |,
     """
 
     def __init__(self, dim_obs=1, name='local_linear_trend'):
@@ -147,6 +180,9 @@ class LocalLinearTrend(STSComponent):
 
         # Fixed observation matrix.
         self._obs_mat = jnp.kron(jnp.array([1, 0]), jnp.eye(dim_obs))
+
+        # Covariance selection matrix.
+        self._cov_select_mat = jnp.eye(2*dim_obs)
 
     def initialize_params(self, obs_initial, obs_scale):
         # Initialize the distribution of the initial state.
@@ -176,53 +212,86 @@ class LocalLinearTrend(STSComponent):
 
     @property
     def cov_select_mat(self):
-        return jnp.eye(2*self.dim_obs)
+        return self._cov_select_mat
 
 
 class SeasonalDummy(STSComponent):
     """The (dummy) seasonal component of the structual time series (STS) model
-    Since on average sum_{j=0}^{num_seasons-1}s_{t+1-j} = 0 for any t,
-    the seasonal effect (random) for next time step is:
 
-    s_{t+1} = - sum_{j=1}^{num_seasons-1} s_{t+1-j} + N(0, drift_covariance)
+    Since at any step t the seasonal effect has following constraint
+
+        sum_{j=1}^{num_seasons} s_{t-j} = 0,
+
+    the seasonal effect (random) of next time step takes the form:
+
+        s_{t+1} = - sum_{j=1}^{num_seasons-1} s_{t+1-j} + N(0, drift_cov)
+
+    and the last term is the stochastic noise of the seasonal effect following
+    a normal distribution with mean zero(s) and covariance drift_cov.
+    So the latent state corresponding to the seasonal component has dimension
+    (num_seasons - 1) * dim_obs
+
+    If dim_obs = 1, and suppose num_seasons = 4
+
+                    | -1, -1, -1 |
+        trans_mat = |  1,  0   0 |    obs_mat = [ 1, 0, 0 ]
+                    |  0,  1,  0 |,
 
     Args (in addition to name and dim_obs):
         num_seasons (int): number of seasons.
-        num_steps_per_season:
+        num_steps_per_season: consecutive steps that each seasonal effect does not change.
+            For example, if a STS model has a weekly seasonal effect but the data is measured
+            daily, then num_steps_per_season = 7;
+            and if a STS model has a daily seasonal effect but the data is measured hourly,
+            then num_steps_per_season = 24.
     """
 
     def __init__(self, num_seasons, num_steps_per_season=1, dim_obs=1, name='seasonal_dummy'):
         super().__init__(name=name, dim_obs=dim_obs)
 
-        self.initial_distribution = MVN(jnp.zeros(num_seasons*dim_obs), jnp.eye(num_seasons*dim_obs))
+        self.num_seasons = num_seasons
         self.steps_per_season = num_steps_per_season
 
-        self.param_props['drift_cov'] = None
-        self.priors['drift_cov'] = None
+        _c = self.num_seasons - 1
+        self.initial_distribution = MVN(jnp.zeros(_c*dim_obs), jnp.eye(_c*dim_obs))
+
+        self.param_props['drift_cov'] = Prop(trainable=True, constrainer=RealToPSD)
+        self.priors['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
         self.params['drift_cov'] = self.priors['drift_cov'].mode()
 
-        # The 
-        self._trans_mat = jnp.block(
-            [[jnp.kron(-jnp.ones(self.num_seasons-1), jnp.eye(self.dim_obs))],
-             [jnp.eye((self.num_seasons-2)*self.dim_obs),
-              jnp.zeros(((self.num_seasons-2)*self.dim_obs, self.dim_obs))]])
+        # The seasonal component has a fixed transition matrix.
+        self._trans_mat = jnp.kron(jnp.block([[-jnp.ones(_c)],
+                                              [jnp.eye(_c-1), jnp.zeros((_c-1, 1))]]),
+                                   jnp.eye(dim_obs))
 
-        # Fixed 
+        # Fixed observation matrix.
+        self._obs_mat = jnp.kron(jnp.eye(_c)[0], jnp.eye(dim_obs))
 
-    def initialize_params(self, obs_scale):
-        raise NotImplementedError
+        # Covariance selection matrix.
+        self._cov_select_mat = jnp.kron(jnp.eye(_c)[:, 0], jnp.eye(dim_obs))
+
+    def initialize_params(self, obs_initial, obs_scale):
+        # Initialize the distribution of the initial state.
+        dim_obs = len(obs_initial)
+        initial_mean = jnp.zeros((self.num_seasons-1) * dim_obs)
+        initial_cov = jnp.kron(jnp.eye(self.num_seasons-1), jnp.diag(obs_scale))
+        self.initial_distribution = MVN(initial_mean, initial_cov)
+
+        # Initialize parameters.
+        self.priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.priors['drift_cov'].mode()
 
     @jit
     def get_trans_mat(self, params, t):
-        update = t % self.steps_per_season == 0
+        update = (t % self.steps_per_season == 0)
         if update:
-            return self.trans_mat
+            return self._trans_mat
         else:
-            return jnp.eye(self.dim_obs)
+            return jnp.eye((self.num_seasons-1) * self.dim_obs)
 
     @jit
     def get_trans_cov(self, params, t):
-        update = t % self.steps_per_season == 0
+        update = (t % self.steps_per_season == 0)
         if update:
             return params['drift_cov']
         else:
@@ -230,12 +299,11 @@ class SeasonalDummy(STSComponent):
 
     @jit
     def obs_mat(self):
-        return jnp.block(
-            [jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])
+        return self._obs_mat
 
     @property
     def cov_select_mat(self):
-        raise NotImplementedError
+        return self._cov_select_mat
 
 
 class SeasonalTrig(STSComponent):
@@ -249,9 +317,13 @@ class SeasonalTrig(STSComponent):
     for
     j = 1, ..., [s/2], with 's' being the number of seasons
 
-    Args:
-        num_seasons (int): number of seasons (assuming number of steps per season is 1)
-        num_steps_per_season:
+    Args (in addition to name and dim_obs):
+        num_seasons (int): number of seasons.
+        num_steps_per_season: consecutive steps that each seasonal effect does not change.
+            For example, if a STS model has a weekly seasonal effect but the data is measured
+            daily, then num_steps_per_season = 7;
+            and if a STS model has a daily seasonal effect but the data is measured hourly,
+            then num_steps_per_season = 24.
     """
 
     def __init__(self, num_seasons, num_steps_per_season=1, dim_obs=1, name='seasonal_trig'):
