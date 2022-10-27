@@ -59,8 +59,7 @@ class StructuralTimeSeries():
             c.initialize_params(obs_scale)
 
         # Aggeragate components
-        self.initial_mean = []
-        self.initial_cov = []
+        self.initial_distributions = OrderedDict()
         self.params = OrderedDict()
         self.param_props = OrderedDict()
         self.priors = OrderedDict()
@@ -69,8 +68,7 @@ class StructuralTimeSeries():
         self.trans_cov_getters = OrderedDict()
 
         for c in components.items:
-            self.initial_mean.append(c.initial_mean)
-            self.initial_cov.append(c.initial_cov)
+            self.initial_distributions[c.name](c.initial_distribution)
             self.params[c.name] = c.params
             self.param_props[c.name] = c.param_props
             self.priors[c.name] = c.param_props
@@ -81,33 +79,6 @@ class StructuralTimeSeries():
         self.params['obs_cov'] = obs_cov
         self.param_props['obs_cov'] = obs_cov_props
         self.priors['obs_cov'] = obs_cov_prior
-
-    @jit
-    def get_trans_mat(self, params, t):
-        trans_mat = []
-        for c_name, c_params in params:
-            trans_getter = self.trans_mat_getters[c_params]
-            c_trans_mat = trans_getter(c_params, t)
-            trans_mat.append(c_trans_mat)
-        return jsp.blockdiag(trans_mat)
-
-    @jit
-    def get_obs_mat(self, params, t):
-        obs_mat = []
-        for c_name, c_params in params:
-            obs_getter = self.obs_mat_getters[c_name]
-            c_obs_mat = obs_getter(c_params, t)
-            obs_mat.append(c_obs_mat)
-        return jnp.concatenate(obs_mat)
-
-    @jit
-    def get_trans_cov(self, params, t):
-        trans_cov = []
-        for c_name, c_params in params:
-            cov_getter = self.trans_cov_getters[c_params]
-            c_trans_cov = cov_getter(c_params, t)
-            trans_cov.append(c_trans_cov)
-        return jnp.blockdiag(trans_cov)
 
     def as_ssm(self):
         """Formulate the STS model as a linear Gaussian state space model:
@@ -123,8 +94,9 @@ class StructuralTimeSeries():
         """
         if self.obs_family == 'Gaussian':
             sts_ssm = GaussianSSM(
-                self.params, self.param_props, self.priors, self.get_trans_mat, self.get_obs_mat,
-                self.get_trans_cov, self.initial_mean, self.initial_cov, self.cov_select_mat)
+                self.params, self.param_props, self.priors,
+                self.trans_mat_getters, self.obs_mat_getters, self.trans_cov_getters,
+                self.initial_mean, self.initial_cov, self.cov_select_mat)
         elif self.obs_family == 'Poisson':
             sts_ssm = PoissonSSM(
                 self.params, self.param_props, self.priors, self.get_trans_mat, self.get_obs_mat,

@@ -53,23 +53,21 @@ class _StructuralTimeSeriesSSM(SSM):
                  params,
                  param_props,
                  priors,
-                 get_trans_mat,
-                 get_obs_mat,
-                 get_trans_cov,
-                 initial_mean,
-                 initial_cov,
+                 trans_mat_getters,
+                 obs_mat_getters,
+                 trans_cov_getters,
+                 initial_distributions,
                  cov_select_mat):
         self.params = params
         self.param_props = param_props
         self.param_priors = priors
 
-        self.initial_mean = initial_mean
-        self.initial_covariance = initial_cov
-        self.sparse_mat = cov_select_mat
+        self.component_init_dists = initial_distributions
+        self.cov_select_mat = cov_select_mat
 
-        self.get_trans_mat = get_trans_mat
-        self.get_obs_mat = get_obs_mat
-        self.get_obs_cov = get_obs_cov
+        self.trans_mat_getters = OrderedDict()
+        self.obs_mat_getters = OrderedDict()
+        self.trans_cov_getters = OrderedDict()
 
     @property
     def emission_shape(self):
@@ -97,62 +95,69 @@ class _StructuralTimeSeriesSSM(SSM):
         """
         raise NotImplementedError
 
-    def sample(self, key, num_timesteps):
-        """Sample a sequence of latent states and emissions.
-        Args:
-            key: rng key
-            num_timesteps: length of sequence to generate
+    @jit
+    def sample(self, params, key, num_timesteps):
+        """Sample a sequence of latent states and emissions with the given parameters.
+
+        Since the regression is contained in the regression component,
+        so there is no covariates term under the STS framework.
         """
-        comp_cov = jsp.linalg.block_diag(*self.params['dynamics_covariances'].values())
-        dim_comp = comp_cov.shape[-1]
-        spars_matrix = jsp.linalg.block_diag(*self.spars_matrix.values())
+        initial_dists = self.component_init_dists
+        get_trans_mat = partial(self.get_trans_mat, params=params)
+        get_trans_cov = partial(self.get_trans_cov, params=params)
+        cov_select_mat = self.cov_select_mat
+        dim_comp = get_trans_cov(0).shape[-1]
 
         def _step(prev_state, args):
-            key, input = args
+            key, t = args
             key1, key2 = jr.split(key, 2)
-            state = prev_state + spars_matrix @ MVN(jnp.zeros(dim_comp), comp_cov).sample(seed=key1)
-            emission = self.emission_distribution(state, input).sample(seed=key2)
-            return state, (state, emission)
+            next_state = get_trans_mat(t) @ prev_state
+            next_state = next_state + cov_select_mat @ MVN(jnp.zeros(dim_comp),
+                                                           get_trans_cov(t)).sample(seed=key1)
+            emission = self.emission_distribution(prev_state).sample(seed=key2)
+            return next_state, (prev_state, emission)
 
         # Sample the initial state
-        key1, key2, key = jr.split(key, 3)
-        initial_state = self.initial_distribution().sample(seed=key1)
-        initial_emission = self.emission_distribution(initial_state, inputs[0]).sample(seed=key2)
+        key1, key2 = jr.split(key, 2)
+        key1s = jr.split(key1, len(initial_dists))
+        initial_state = jnp.concatenate([c_dist.sample(seed=key)
+                                         for c_dist, key in (initial_dists, key1s)])
 
         # Sample the remaining emissions and states
-        keys = jr.split(key, num_timesteps - 1)
-        _, (states, emissions) = lax.scan(_step, initial_state, (keys, inputs[1:]))
+        key2s = jr.split(key2, num_timesteps)
+        _, (states, emissions) = lax.scan(_step, initial_state, (key2s, jnp.arange(num_timesteps)))
 
-        # Concatenate the initial state and emission with the following ones
-        samp_states = jnp.concatenate((jnp.expand_dims(initial_state, 0), states))
-        samp_emissions = jnp.concatenate((jnp.expand_dims(initial_emission, 0), emissions))
-        return samp_states, samp_emissions
+        return states, emissions
 
-    def marginal_log_prob(self, params, emissions):
+    @jit
+    def marginal_log_prob(self, params, obs_time_series):
         """Compute log marginal likelihood of observations."""
         ssm_params = self._to_ssm_params(params)
-        filtered_posterior = self._ssm_filter(params=ssm_params, emissions=emissions)
+        filtered_posterior = self._ssm_filter(params=ssm_params, emissions=obs_time_series)
         return filtered_posterior.marginal_loglik
 
-    def posterior_sample(self, key, observed_time_series):
-        num_timesteps, dim_obs = observed_time_series.shape
-        if inputs is None:
-            inputs = jnp.zeros((num_timesteps, 0))
-        ssm_params = self._to_ssm_params(self.params)
-        ll, states = self._ssm_posterior_sample(key, ssm_params, observed_time_series, inputs)
-        obs_means = states @ self.emission_matrix.T + inputs @ self.params['regression_weights'].T
+    @jit
+    def posterior_sample(self, params, key, obs_time_series):
+        key1, key2 = jr.split(key, 2)
+        num_timesteps, dim_obs = obs_time_series.shape
+        ssm_params = self._to_ssm_params(params)
+        obs_mats = vmap(self.get_obs_mat, (None, 0))(params, jnp.arange(num_timesteps))
+
+        ll, states = self._ssm_posterior_sample(key1, ssm_params, obs_time_series)
+        obs_means = vmap(jnp.matmul)(obs_mats, obs_time_series)
         obs_means = self._emission_constrainer(obs_means)
-        obs = self.emission_distribution(states, inputs).sample(seed=key,
-                                                                sample_shape=num_timesteps)
+        key2s = jr.split(key2, num_timesteps)
+        emission_sampler = lambda state, key: self.emission_distribution(state).sample(seed=key)
+        obs = vmap(emission_sampler)(states, key2s)
         return obs_means, obs
 
-    def component_posterior(self, emissions):
+    def component_posterior(self, obs_time_series):
         """Smoothing by component
         """
         # Compute the posterior of the joint SSM model
         component_pos = OrderedDict()
         ssm_params = self._to_ssm_params(self.params)
-        pos = self._ssm_smoother(ssm_params, emissions)
+        pos = self._ssm_smoother(ssm_params, obs_time_series)
         mu_pos = pos.smoothed_means
         var_pos = pos.smoothed_covariances
 
@@ -339,6 +344,33 @@ class _StructuralTimeSeriesSSM(SSM):
         _, (ts_means, ts_mean_covs, ts) = lax.scan(_step, initial_params, (keys, forecast_inputs))
 
         return ts_means, ts_mean_covs, ts
+
+    @jit
+    def get_trans_mat(self, params, t):
+        trans_mat = []
+        for c_name, c_params in params:
+            trans_getter = self.trans_mat_getters[c_params]
+            c_trans_mat = trans_getter(c_params, t)
+            trans_mat.append(c_trans_mat)
+        return jsp.blockdiag(trans_mat)
+
+    @jit
+    def get_obs_mat(self, params, t):
+        obs_mat = []
+        for c_name, c_params in params:
+            obs_getter = self.obs_mat_getters[c_name]
+            c_obs_mat = obs_getter(c_params, t)
+            obs_mat.append(c_obs_mat)
+        return jnp.concatenate(obs_mat)
+
+    @jit
+    def get_trans_cov(self, params, t):
+        trans_cov = []
+        for c_name, c_params in params:
+            cov_getter = self.trans_cov_getters[c_params]
+            c_trans_cov = cov_getter(c_params, t)
+            trans_cov.append(c_trans_cov)
+        return jnp.blockdiag(trans_cov)
 
     def _to_ssm_params(self, params):
         """Wrap the STS model into the form of the corresponding SSM model """

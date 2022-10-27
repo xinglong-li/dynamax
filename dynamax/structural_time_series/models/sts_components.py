@@ -3,6 +3,9 @@ from abc import abstractmethod
 from collections import OrderedDict
 from jax import jit
 import jax.numpy as jnp
+from tensorflow_probability.substrates.jax.distributions import (
+    MultivariateNormalFullCovariance as MVN,
+    Deterministic)
 
 
 class STSComponent(ABC):
@@ -15,9 +18,7 @@ class STSComponent(ABC):
     def __init__(self, name, dim_obs=1, *args, **kwargs):
         self.name = name
         self.dim_obs = dim_obs
-
-        self.initial_mean = None
-        self.initial_cov = None
+        self.initial_distribution = None
 
         self.params = OrderedDict()
         self.param_props = OrderedDict()
@@ -72,8 +73,7 @@ class LocalLinearTrend(STSComponent):
                  name='local_linear_trend'):
         super().__init__()
 
-        self.initial_mean = jnp.zeros((dim_obs, 1))
-        self.initial_cov = jnp.eye(dim_obs)
+        self.initial_distribution = None
 
         self.params['cov_level'] = None
         self.param_props['cov_level'] = None
@@ -109,8 +109,7 @@ class Autoregressive(STSComponent):
     def __init__(self, p, dim_obs=1, name='ar'):
         super().__init__()
 
-        self.initial_mean = jnp.zeros((dim_obs, 1))
-        self.initial_cov = jnp.eye(dim_obs)
+        self.initial_distribution = None
 
         self.params = OrderedDict()
         self.param_props = OrderedDict()
@@ -163,8 +162,7 @@ class SeasonalDummy(STSComponent):
                  name='seasonal_dummy'):
         super().__init__()
 
-        self.initial_mean = jnp.zeros((dim_obs, 1))
-        self.initial_cov = jnp.eye(dim_obs)
+        self.initial_distribution = None
         self.steps_per_season = num_steps_per_season
 
         self.params['drift_cov'] = None
@@ -234,8 +232,7 @@ class SeasonalTrig(STSComponent):
                  name='seasonal_trig'):
         super().__init__()
 
-        self.initial_mean = jnp.zeros((dim_obs, 1))
-        self.initial_cov = jnp.eye(dim_obs)
+        self.initial_distribution = None
         self.num_seasons = num_seasons
         self.num_steps_per_season = num_steps_per_season
 
@@ -292,8 +289,7 @@ class Cycle(STSComponent):
 
         super().__init__()
 
-        self.initial_mean = jnp.zeros((dim_obs, 1))
-        self.initial_cov = jnp.eye(dim_obs)
+        self.initial_distribution = None
 
         # Parameters of the component
         self.params['damp'] = damp
@@ -349,8 +345,7 @@ class LinearRegression(STSComponent):
             self.inputs = covariates
         dim_inputs = self.inputs.shape[-1]
         
-        self.initial_mean = jnp.zeros((dim_obs, 1))
-        self.initial_cov = jnp.eye(dim_obs)
+        self.initial_distribution = None
 
         self.params['weights'] = jnp.zeros((dim_inputs, dim_obs))
         self.param_props['weights'] = None
