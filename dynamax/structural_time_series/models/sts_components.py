@@ -1,11 +1,21 @@
-from abc import ABC
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dynamax.distributions import InverseWishart as IW
+from dynamax.utils import PSDToRealBijector
+from dynamax.parameters import ParameterProperties as Prop
 from jax import jit
 import jax.numpy as jnp
 from tensorflow_probability.substrates.jax.distributions import (
     MultivariateNormalFullCovariance as MVN)
+import tensorflow_probability.substrates.jax.bijectors as tfb
 
+
+RealToPSD = tfb.Invert(PSDToRealBijector)
+
+
+#########################
+#  Abstract Components  #
+#########################
 
 class STSComponent(ABC):
     """Meta class of latent component of structural time series (STS) models.
@@ -23,24 +33,25 @@ class STSComponent(ABC):
     priors (OrderedDict): prior distributions for each item in 'params'.
     """
 
-    def __init__(self, name, dim_obs=1, *args, **kwargs):
+    def __init__(self, name, dim_obs=1):
         self.name = name
         self.dim_obs = dim_obs
         self.initial_distribution = None
 
-        self.params = OrderedDict()
         self.param_props = OrderedDict()
         self.priors = OrderedDict()
+        self.params = OrderedDict()
 
     @abstractmethod
-    def initialize_params(self, obs_scale):
+    def initialize_params(self, obs_initial, obs_scale):
         """Initialize parameters in self.params given the scale of the observed time series.
 
         Args:
-            obs_scale (self.dim_obs, ): scale of the observed time series.
+            obs_initial (self.dim_obs,): the first observation in the observed time series.
+            obs_scale (self.dim_obs,): scale of the observed time series.
 
         Returns:
-            No returns. Change self.params directly.
+            No returns. Change self.params and self.initial_distributions directly.
         """
         raise NotImplementedError
 
@@ -82,7 +93,7 @@ class STSRegression(ABC):
         ABC (_type_): _description_
     """
 
-    def __init__(self, name, dim_obs=1, *args, **kwargs):
+    def __init__(self, name, dim_obs=1):
         self.name = name
         self.dim_obs = dim_obs
 
@@ -99,69 +110,81 @@ class STSRegression(ABC):
         raise NotImplementedError
 
 
+#########################
+#  Concrete Components  #
+#########################
+
+
 class LocalLinearTrend(STSComponent):
     """The local linear trend component of the structual time series (STS) model
 
-    level[t+1] = level[t] + slope[t] + N(0, level_covariance)
-    slope[t+1] = slope[t] + N(0, slope_covariance)
+    The latent state is [level, slope], and the dynamics is
 
-    The latent state is [level, slope].
+    level[t+1] = level[t] + slope[t] + N(0, cov_level)
+    slope[t+1] = slope[t] + N(0, cov_slope)
 
-    Args:
-        level_covariance_prior: A tfd.Distribution instance, an InverseWishart prior by default
-        slope_covariance_prior: A tfd.Distribution instance, an InverseWishart prior by default
-        initial_level_prior: A tfd.Distribution prior for the level part of the initial state,
-                             a MultivariateNormal by default
-        initial_slope_prior: A tfd.Distribution prior for the slope part of the initial state,
-                             a MultivariateNormal by default
-        observed_time_series: has shape (batch_size, timesteps, dim_observed_timeseries)
-        dim_observed_time_series: dimension of the observed time series
-        name (str):               name of the component in the STS model
+    In the observed time series is in 1-d:
+
+    trans_mat = | 1, 1 |    obs_mat = | 1, 0 |
+                | 0, 1 |,
     """
 
-    def __init__(self,
-                 dim_obs=1,
-                 name='local_linear_trend'):
+    def __init__(self, dim_obs=1, name='local_linear_trend'):
         super().__init__(name=name, dim_obs=dim_obs)
 
-        self.initial_distribution = None
+        self.initial_distribution = MVN(jnp.zeros(2*dim_obs), jnp.eye(2*dim_obs))
 
-        self.params['cov_level'] = None
-        self.param_props['cov_level'] = None
-        self.priors['cov_level'] = None
+        self.param_props['cov_level'] = Prop(trainable=True, constrainer=RealToPSD)
+        self.priors['cov_level'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['cov_level'] = self.priors['cov_level'].mode()
 
-        self.params['cov_slope'] = None
-        self.param_props['cov_slope'] = None
-        self.priors['cov_slope'] = None
+        self.param_props['cov_slope'] = Prop(trainable=True, constrainer=RealToPSD)
+        self.priors['cov_slope'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['cov_slope'] = self.priors['cov_slope'].mode()
 
-    def initialize_params(self, obs_scale):
-        raise NotImplementedError
+        # The local linear trend component has a fixed transition matrix.
+        self._tran_mat = jnp.kron(jnp.array([[1, 1], [0, 1]]), jnp.eye(dim_obs))
 
-    @jit
+        # Fixed observation matrix.
+        self._obs_mat = jnp.kron(jnp.array([1, 0]), jnp.eye(dim_obs))
+
+    def initialize_params(self, obs_initial, obs_scale):
+        # Initialize the distribution of the initial state.
+        dim_obs = len(obs_initial)
+        initial_mean = jnp.tile(obs_initial, 2)
+        initial_cov = jnp.kron(jnp.eye(2), jnp.diag(obs_scale))
+        self.initial_distribution = MVN(initial_mean, initial_cov)
+
+        # Initialize parameters.
+        self.priors['cov_level'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['cov_level'] = self.priors['cov_level'].mode()
+        self.priors['cov_slope'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['cov_slope'] = self.priors['cov_slope'].mode()
+
     def get_trans_mat(self, params, t):
-        return jnp.block([[jnp.eye(self.dim_obs), jnp.eye(self.dim_obs)],
-                          [jnp.zeros((self.dim_obs, self.dim_obs)), jnp.eye(self.dim_obs)]])
+        return self._trans_mat
 
     @jit
     def get_trans_cov(self, params, t):
-        return jnp.block([[params['cov_level'], jnp.zeros((self.dim_obs, self.dim_obs))],
-                          [jnp.zeros((self.dim_obs, self.dim_obs)), params['cov_slope']]])
+        _shape = params['cov_level'].shape
+        return jnp.block([[params['cov_level'], jnp.zeros(_shape)],
+                          [jnp.zeros(_shape), params['cov_slope']]])
 
-    @jit
+    @property
     def obs_mat(self):
-        return jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))])
+        return self._obs_mat
 
     @property
     def cov_select_mat(self):
-        raise NotImplementedError
+        return jnp.eye(2*self.dim_obs)
 
 
 class Autoregressive(STSComponent):
     def __init__(self, p, dim_obs=1, name='ar'):
         super().__init__(name=name, dim_obs=dim_obs)
 
+        # 
         self.initial_distribution = None
-
         self.params = OrderedDict()
         self.params['coef'] = None
         self.params['noise_cov'] = None
