@@ -321,8 +321,7 @@ class _StructuralTimeSeriesSSM(SSM):
     def get_obs_mat(self, params, t):
         obs_mat = []
         for c_name, c_params in params:
-            obs_getter = self.obs_mat_getters[c_name]
-            c_obs_mat = obs_getter(c_params, t)
+            c_obs_mat = self.obs_mats[c_name]
             obs_mat.append(c_obs_mat)
         return jnp.concatenate(obs_mat)
 

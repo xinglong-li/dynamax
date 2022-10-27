@@ -4,15 +4,23 @@ from collections import OrderedDict
 from jax import jit
 import jax.numpy as jnp
 from tensorflow_probability.substrates.jax.distributions import (
-    MultivariateNormalFullCovariance as MVN,
-    Deterministic)
+    MultivariateNormalFullCovariance as MVN)
 
 
 class STSComponent(ABC):
     """Meta class of latent component of structural time series (STS) models.
 
-    Args:
-        ABC (_type_): _description_
+    A latent component of the STS model has following arributes:
+
+    name (string): name of the latend component.
+    dim_obs (int): dimension of the observation in each step of the observed time series.
+    initial_distribution (MVN): an instance of MultivariateNormalFullCovariance,
+        specifies the distribution for the inital state.
+    params (OrderedDict): parameters of the component need to be learned in model fitting.
+    param_props (OrderedDict): properties of each item in 'params'.
+        Each item is an instance of ParameterProperties, which specifies constrainer
+        of the parameter and whether the parameter is trainable.
+    priors (OrderedDict): prior distributions for each item in 'params'.
     """
 
     def __init__(self, name, dim_obs=1, *args, **kwargs):
@@ -26,14 +34,32 @@ class STSComponent(ABC):
 
     @abstractmethod
     def initialize_params(self, obs_scale):
+        """Initialize parameters in self.params given the scale of the observed time series.
+
+        Args:
+            obs_scale (self.dim_obs, ): scale of the observed time series.
+
+        Returns:
+            No returns. Change self.params directly.
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def get_trans_mat(self, cur_params, t):
+    def get_trans_mat(self, params, t):
+        """Compute the transition matrix at step t of the latent dynamics.
+
+        Args:
+            params (OrderedDict): parameters based on which the transition matrix
+                is to be evalueated. Has the same tree structure with self.params.
+            t (int): time steps
+
+        Returns:
+            trans_mat (dim_of_state, dim_of_state): transition matrix at step t
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def get_trans_cov(self, cur_params, t):
+    def get_trans_cov(self, params):
         """Nonsingular covariance matrix"""
         raise NotImplementedError
 
@@ -46,6 +72,30 @@ class STSComponent(ABC):
     @abstractmethod
     def cov_select_mat(self):
         """Select matrix that makes the covariance matrix singular"""
+        raise NotImplementedError
+
+
+class STSRegression(ABC):
+    """Meta class of regression component of structural time series (STS) models.
+
+    Args:
+        ABC (_type_): _description_
+    """
+
+    def __init__(self, name, dim_obs=1, *args, **kwargs):
+        self.name = name
+        self.dim_obs = dim_obs
+
+        self.params = OrderedDict()
+        self.param_props = OrderedDict()
+        self.priors = OrderedDict()
+
+    @abstractmethod
+    def initialize(self, covariates, obs_time_series):
+        raise NotImplementedError
+
+    @abstractmethod
+    def fitted_values(self, params, covariates):
         raise NotImplementedError
 
 
@@ -72,7 +122,7 @@ class LocalLinearTrend(STSComponent):
     def __init__(self,
                  dim_obs=1,
                  name='local_linear_trend'):
-        super().__init__()
+        super().__init__(name=name, dim_obs=dim_obs)
 
         self.initial_distribution = None
 
@@ -88,14 +138,14 @@ class LocalLinearTrend(STSComponent):
         raise NotImplementedError
 
     @jit
-    def get_trans_mat(self, cur_params, t):
+    def get_trans_mat(self, params, t):
         return jnp.block([[jnp.eye(self.dim_obs), jnp.eye(self.dim_obs)],
                           [jnp.zeros((self.dim_obs, self.dim_obs)), jnp.eye(self.dim_obs)]])
 
     @jit
-    def get_trans_cov(self, cur_params, t):
-        return jnp.block([[cur_params['cov_level'], jnp.zeros((self.dim_obs, self.dim_obs))],
-                          [jnp.zeros((self.dim_obs, self.dim_obs)), cur_params['cov_slope']]])
+    def get_trans_cov(self, params, t):
+        return jnp.block([[params['cov_level'], jnp.zeros((self.dim_obs, self.dim_obs))],
+                          [jnp.zeros((self.dim_obs, self.dim_obs)), params['cov_slope']]])
 
     @jit
     def obs_mat(self):
@@ -108,7 +158,7 @@ class LocalLinearTrend(STSComponent):
 
 class Autoregressive(STSComponent):
     def __init__(self, p, dim_obs=1, name='ar'):
-        super().__init__()
+        super().__init__(name=name, dim_obs=dim_obs)
 
         self.initial_distribution = None
 
@@ -131,7 +181,7 @@ class Autoregressive(STSComponent):
         if order > 1:
             m = jnp.block([phi[:, None], jnp.vstack((jnp.eye(order-1), jnp.zeros((order-1, 1))))])
         else:
-            m = phi[None,:]
+            m = phi[None, :]
         return jnp.kron(m, jnp.eye(self.dim_obs))
 
     @jit
@@ -169,7 +219,7 @@ class SeasonalDummy(STSComponent):
                  num_steps_per_season=1,
                  dim_obs=1,
                  name='seasonal_dummy'):
-        super().__init__()
+        super().__init__(name=name, dim_obs=dim_obs)
 
         self.initial_distribution = None
         self.steps_per_season = num_steps_per_season
@@ -177,7 +227,7 @@ class SeasonalDummy(STSComponent):
         self.params['drift_cov'] = None
         self.param_props['drift_cov'] = None
         self.priors['drift_cov'] = None
-        
+
         self._trans_mat = jnp.block(
             [[jnp.kron(-jnp.ones(self.num_seasons-1), jnp.eye(self.dim_obs))],
              [jnp.eye((self.num_seasons-2)*self.dim_obs),
@@ -238,7 +288,7 @@ class SeasonalTrig(STSComponent):
                  num_steps_per_season=1,
                  dim_obs=1,
                  name='seasonal_trig'):
-        super().__init__()
+        super().__init__(name=name, dim_obs=dim_obs)
 
         self.initial_distribution = None
         self.num_seasons = num_seasons
@@ -295,7 +345,7 @@ class Cycle(STSComponent):
             dim_obs = len(damp)
             assert all(damp > 0.) and all(damp < 1.), "The damping factor shoul be in range (0, 1)."
 
-        super().__init__()
+        super().__init__(name=name, dim_obs=dim_obs)
 
         self.initial_distribution = None
 
@@ -311,12 +361,12 @@ class Cycle(STSComponent):
         self.params['cov'] = covariance
         self.param_props['cov'] = None
         self.priors['cov'] = None
-        
+
     def initialize_params(self, obs_scale):
         raise NotImplementedError
 
     @jit
-    def get_trans_mat(self, cur_params, t):
+    def get_trans_mat(self, params, t):
         damp = jnp.diag(self.params['damp'])
         cos_fr = jnp.diag(jnp.cos(self.params['frequency']))
         sin_fr = jnp.diag(jnp.sin(self.params['frequency']))
@@ -338,7 +388,7 @@ class Cycle(STSComponent):
         raise NotImplementedError
 
 
-class LinearRegression():
+class LinearRegression(STSRegression):
     """The linear regression component of the structural time series model.
 
     Args:

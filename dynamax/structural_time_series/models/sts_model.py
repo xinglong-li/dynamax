@@ -64,7 +64,7 @@ class StructuralTimeSeries():
         self.param_props = OrderedDict()
         self.priors = OrderedDict()
         self.trans_mat_getters = OrderedDict()
-        self.obs_mat_getters = OrderedDict()
+        self.obs_mats = OrderedDict()
         self.trans_cov_getters = OrderedDict()
 
         for c in components:
@@ -74,7 +74,7 @@ class StructuralTimeSeries():
                 self.param_props[c.name] = c.param_props
                 self.priors[c.name] = c.param_props
                 self.trans_mat_getters[c.name] = c.get_trans_mat
-                self.obs_mat_getters[c.name] = c.get_obs_mat
+                self.obs_mats[c.name] = c.obs_mat
                 self.trans_cov_getters[c.name] = c.get_trans_cov
         self.params['obs_cov'] = obs_cov
         self.param_props['obs_cov'] = obs_cov_props
@@ -100,7 +100,7 @@ class StructuralTimeSeries():
         if self.obs_family == 'Gaussian':
             sts_ssm = GaussianSSM(
                 self.params, self.param_props, self.priors,
-                self.trans_mat_getters, self.obs_mat_getters, self.trans_cov_getters,
+                self.trans_mat_getters, self.obs_mats, self.trans_cov_getters,
                 self.initial_mean, self.initial_cov, self.cov_select_mat)
         elif self.obs_family == 'Poisson':
             sts_ssm = PoissonSSM(
