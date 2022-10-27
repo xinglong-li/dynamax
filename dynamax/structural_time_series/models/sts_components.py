@@ -17,6 +17,7 @@ RealToPSD = tfb.Invert(PSDToRealBijector)
 #  Abstract Components  #
 #########################
 
+
 class STSComponent(ABC):
     """Meta class of latent component of structural time series (STS) models.
 
@@ -187,8 +188,8 @@ class LocalLinearTrend(STSComponent):
     def initialize_params(self, obs_initial, obs_scale):
         # Initialize the distribution of the initial state.
         dim_obs = len(obs_initial)
-        initial_mean = jnp.tile(obs_initial, 2)
-        initial_cov = jnp.kron(jnp.eye(2), jnp.diag(obs_scale))
+        initial_mean = jnp.concatenate((obs_initial, jnp.zeros(dim_obs)))
+        initial_cov = jnp.kron(jnp.eye(2), jnp.diag(obs_scale**2))
         self.initial_distribution = MVN(initial_mean, initial_cov)
 
         # Initialize parameters.
@@ -224,10 +225,10 @@ class SeasonalDummy(STSComponent):
 
     the seasonal effect (random) of next time step takes the form:
 
-        s_{t+1} = - sum_{j=1}^{num_seasons-1} s_{t+1-j} + N(0, drift_cov)
+        s_{t+1} = - sum_{j=1}^{num_seasons-1} s_{t+1-j} + w_{t+1}
 
-    and the last term is the stochastic noise of the seasonal effect following
-    a normal distribution with mean zero(s) and covariance drift_cov.
+    and the last term w_{t+1} is the stochastic noise of the seasonal effect
+    following a normal distribution with mean zero and covariance drift_cov.
     So the latent state corresponding to the seasonal component has dimension
     (num_seasons - 1) * dim_obs
 
@@ -274,7 +275,7 @@ class SeasonalDummy(STSComponent):
         # Initialize the distribution of the initial state.
         dim_obs = len(obs_initial)
         initial_mean = jnp.zeros((self.num_seasons-1) * dim_obs)
-        initial_cov = jnp.kron(jnp.eye(self.num_seasons-1), jnp.diag(obs_scale))
+        initial_cov = jnp.kron(jnp.eye(self.num_seasons-1), jnp.diag(obs_scale**2))
         self.initial_distribution = MVN(initial_mean, initial_cov)
 
         # Initialize parameters.
@@ -307,15 +308,30 @@ class SeasonalDummy(STSComponent):
 
 
 class SeasonalTrig(STSComponent):
-    """The trigonometric seasonal component of the structual time series (STS) model
-    (Current formulation only support 1-d observation case)
+    """The trigonometric seasonal component of the structual time series (STS) model.
 
-    \gamma_t = \sum_{j=1}^{s/2} \gamma_{jt}
+    The seasonal effect (random) of next time step takes the form (let s:=num_seasons):
+
+        \gamma_t = \sum_{j=1}^{floor(s/2)} \gamma_{jt}
+
     where
-    \gamma_{j, t+1} = \gamma_{jt} cos(\lambda_j) + \gamma*_{jt} sin(\lambda_j) + w_{jt}
-    \gamma*_{j, t+1} = -\gamma_{jt} sin(\lambda_j) + \gamma*_{jt} cos(\lambda_j) + w*_{jt}
-    for
-    j = 1, ..., [s/2], with 's' being the number of seasons
+
+        \gamma_{j, t+1}  =  cos(\lambda_j) \gamma_{jt} + sin(\lambda_j) \gamma*_{jt}  + w_{jt}
+        \gamma*_{j, t+1} = -sin(\lambda_j) \gamma_{jt} + cos(\lambda_j) \gamma*_{jt}  + w*_{jt}
+
+    for j = 1, ..., floor(s/2).
+    The last term w_{jt}, w^*_{jt} are stochastic noises of the seasonal effect following
+    a normal distribution with mean zeros and a common covariance drift_cov for all j and t.
+
+    The latent state corresponding to the seasonal component has dimension (s-1) * dim_obs.
+    If s is odd, then s-1 = 2 * (s-1)/2, which means thare are j = 1,...,(s-1)/2 blocks.
+    If s is even, then s-1 = 2 * (s/2) - 1, which means there are j = 1,...(s/2) blocks,
+    but we remove the last dimension since this part does not play role in the observation.
+
+    If dim_obs = 1, for j = floor((s-1)/2):
+
+        trans_mat_j = |  cos(\lambda_j), sin(\lambda_j) |    obs_mat_j = [ 1, 0 ]
+                      | -sin(\lambda_j), cos(\lambda_j) |,
 
     Args (in addition to name and dim_obs):
         num_seasons (int): number of seasons.
@@ -329,46 +345,106 @@ class SeasonalTrig(STSComponent):
     def __init__(self, num_seasons, num_steps_per_season=1, dim_obs=1, name='seasonal_trig'):
         super().__init__(name=name, dim_obs=dim_obs)
 
-        self.initial_distribution = None
         self.num_seasons = num_seasons
         self.num_steps_per_season = num_steps_per_season
 
-        self.params['drift_cov'] = None
-        self.params['drift_cov'] = None
-        self.priors['drift_cov'] = None
+        _c = num_seasons - 1
+        self.initial_distribution = MVN(jnp.zeros(_c*dim_obs), jnp.eye(_c*dim_obs))
 
-    def initialize_params(self, obs_scale):
-        raise NotImplementedError
+        self.params['drift_cov'] = Prop(trainable=True, constrainer=RealToPSD)
+        self.params['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.priors['drift_cov'] = self.priors['drift_cov'].mode()
+
+        # The seasonal component has a fixed transition matrix.
+        num_pairs = int(jnp.floor(num_seasons/2))
+        _trans_mat = jnp.zeros((2*num_pairs, 2*num_pairs))
+        for j in 1 + jnp.arange(num_pairs):
+            lamb_j = (2*j * jnp.pi) / num_seasons
+            block_j = jnp.array([[jnp.cos(lamb_j), jnp.sin(lamb_j)],
+                                 [-jnp.sin(lamb_j), jnp.cos(lamb_j)]])
+            _trans_mat = _trans_mat.at[2*(j-1):2*j, 2*(j-1):2*j].set(block_j)
+        if num_seasons % 2 == 0:
+            _trans_mat = _trans_mat[:-1, :-1]
+        self._trans_mat = _trans_mat
+
+        # Fixed observation matrix.
+        _obs_mat = jnp.tile(jnp.array([1, 0]), num_pairs)
+        if num_seasons % 2 == 0:
+            _obs_mat = _obs_mat[:-1]
+        self._obs_mat = _obs_mat[None, :]
+
+        # Covariance selection matrix.
+        self._cov_select_mat = jnp.eye(_c*dim_obs)
+
+    def initialize_params(self, obs_initial, obs_scale):
+        # Initialize the distribution of the initial state.
+        dim_obs = len(obs_initial)
+        initial_mean = jnp.zeros((self.num_seasons-1) * dim_obs)
+        initial_cov = jnp.kron(jnp.eye(self.num_seasons-1), jnp.diag(obs_scale**2))
+        self.initial_distribution = MVN(initial_mean, initial_cov)
+
+        # Initialize parameters.
+        self.priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.priors['drift_cov'].mode()
 
     @jit
-    def get_trans_mat(self, cur_params, t):
-        num_pairs = int(jnp.floor(self.num_seasons/2.))
-        matrix = jnp.zeros((2*num_pairs, 2*num_pairs))
-        for j in 1 + jnp.arange(num_pairs):
-            lamb_j = (2*j * jnp.pi) / self.num_seasons
-            C = jnp.array([[jnp.cos(lamb_j), jnp.sin(lamb_j)],
-                           [-jnp.sin(lamb_j), jnp.cos(lamb_j)]])
-            matrix = matrix.at[2*(j-1):2*j, 2*(j-1):2*j].set(C)
-        if self.num_seasons % 2 == 0:
-            matrix = matrix[:-1, :-1]
-        return {self.component_name: matrix}
+    def get_trans_mat(self, params, t):
+        update = (t % self.steps_per_season == 0)
+        if update:
+            return self._trans_mat
+        else:
+            return jnp.eye((self.num_seasons-1) * self.dim_obs)
 
     @jit
     def get_trans_cov(self, params, t):
-        return jnp.kron(jnp.eye(self.num_seasons-1), params['drift_cov'])
+        update = (t % self.steps_per_season == 0)
+        if update:
+            return params['drift_cov']
+        else:
+            return jnp.zeros((self.dim_obs, self.dim_obs))
 
     @jit
     def obs_mat(self):
-        num_pairs = int(jnp.floor(self.num_seasons/2.))
-        matrix = jnp.tile(
-            jnp.block([jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, self.dim_obs))]), num_pairs)
-        if self.num_seasons % 2 == 0:
-            matrix = matrix[:-self.dim_obs, :]
-        return matrix
+        return self._obs_mat
 
     @property
     def cov_select_mat(self):
-        raise NotImplementedError
+        return self._cov_select_mat
+
+
+class LinearRegression(STSRegression):
+    """The linear regression component of the structural time series model.
+
+    The parameter of the linear regression function is the coefficient matrix W.
+    The shape of W is (dim_obs, dim_covariates) if no bias term is added, and is
+    (dim_obs, dim_covariates + 1) is a bias term is added at the end of the covariates.
+    The regression function has the form:
+
+        f(W, X) = W @ X
+
+    where X = covariates if add_bias=False and X = [covariates, 1] if add_bias=True.
+    """
+    def __init__(self, dim_covariates, add_bias=True, dim_obs=1, name='linear_regression'):
+
+        self.add_bias = add_bias
+
+        dim_inputs = dim_covariates + 1 if add_bias else dim_covariates
+
+        self.params['weights'] = jnp.zeros((dim_inputs, dim_obs))
+        self.param_props['weights'] = None
+        self.priors['weights'] = None
+
+    def initialize(self, covariates, obs_time_series):
+        if self.add_bias:
+            inputs = jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)), axis=0)
+        W = jnp.solve(inputs.T @ inputs, inputs.T @ obs_time_series)
+        self.params['weights'] = W
+
+    def fitted_values(self, params, covariates):
+        if self.add_bias:
+            return params['weights'] @ jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)))
+        else:
+            return params['weights'] @ covariates
 
 
 class Cycle(STSComponent):
@@ -425,35 +501,6 @@ class Cycle(STSComponent):
     @property
     def cov_select_mat(self):
         raise NotImplementedError
-
-
-class LinearRegression(STSRegression):
-    """The linear regression component of the structural time series model.
-
-    Args:
-        STSComponent (_type_): _description_
-    """
-    def __init__(self, dim_covariates, add_bias=True, dim_obs=1, name='linear_regression'):
-
-        self.add_bias = add_bias
-
-        dim_inputs = dim_covariates + 1 if add_bias else dim_covariates
-
-        self.params['weights'] = jnp.zeros((dim_inputs, dim_obs))
-        self.param_props['weights'] = None
-        self.priors['weights'] = None
-
-    def initialize(self, covariates, obs_time_series):
-        if self.add_bias:
-            inputs = jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)), axis=0)
-        W = jnp.solve(inputs.T @ inputs, inputs.T @ observed_time_series)
-        self.params['weights'] = W
-
-    def fitted_values(self, params, covariates):
-        if self.add_bias:
-            return params['weights'] @ jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)))
-        else:
-            return params['weights'] @ covariates
 
 
 class Autoregressive(STSComponent):
