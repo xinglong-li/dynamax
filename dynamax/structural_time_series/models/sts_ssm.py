@@ -7,10 +7,11 @@ import jax.random as jr
 import jax.scipy as jsp
 from jax.tree_util import tree_map
 from dynamax.abstractions import SSM
-from dynamax.cond_moments_gaussian_filter.generalized_gaussian_ssm import (
+from dynamax.cond_moments_gaussian_filter.cmgf import (
     iterated_conditional_moments_gaussian_filter as cmgf_filt,
     iterated_conditional_moments_gaussian_smoother as cmgf_smooth,
     EKFIntegrals)
+from dynamax.cond_moments_gaussian_filter.generalized_gaussian_ssm import GGSSMParams
 from dynamax.linear_gaussian_ssm.inference import (
     LGSSMParams,
     lgssm_filter,
@@ -26,9 +27,9 @@ from dynamax.utils import (
     ensure_array_has_batch_dim)
 from tensorflow_probability.substrates.jax.distributions import (
     MultivariateNormalFullCovariance as MVN,
-    MultivariateNormalDiag as MVNDiag,
     Poisson as Pois)
 from tqdm.auto import trange
+
 
 class _StructuralTimeSeriesSSM(SSM):
     """Formulate the structual time series(STS) model into a LinearSSM model,
@@ -431,30 +432,30 @@ class PoissonSSM(_StructuralTimeSeriesSSM):
 
     def emission_distribution(self, state, inputs):
         log_rate = self.obs_mat @ state + inputs
-        return Poisson(rate=self._emission_constrainer(log_rate))
+        return Pois(rate=self._emission_constrainer(log_rate))
 
     def forecast(self, key, observed_time_series, num_forecast_steps,
                  past_inputs=None, forecast_inputs=None):
         ts_means, ts_mean_covs, ts = super().forecast(
             key, observed_time_series, num_forecast_steps, past_inputs, forecast_inputs)
-        sampler = lambda r, key: Poisson(rate=r).sample(seed=key)
+        sampler = lambda r, key: Pois(rate=r).sample(seed=key)
         ts_samples = vmap(sampler)(ts_means, jr.split(key, num_forecast_steps))
         return ts_samples, ts_means, ts
 
     def _to_ssm_params(self, params):
         """Wrap the STS model into the form of the corresponding SSM model """
         # NOTE: Currently the GGSSMParams does not depends on time poit t.
-        get_trans_mat = self.get_trans_mat(params, t=0)
+        trans_mat = self.get_trans_mat(params, t=0)
         sparse_trans_cov = self.cov_select_mat @ self.get_trans_cov(params, t=0) @ self.cov_select_mat.T
         return GGSSMParams(initial_mean=self.initial_mean,
                            initial_covariance=self.initial_cov,
-                           dynamics_function=lambda z: self.dynamics_matrix @ z,
+                           dynamics_function=lambda z: trans_mat @ z,
                            dynamics_covariance=sparse_trans_cov,
                            emission_mean_function=
                                lambda z: self._emission_constrainer(self.obs_mat @ z),
                            emission_cov_function=
                                lambda z: jnp.diag(self._emission_constrainer(self.obs_mat @ z)),
-                           emission_dist=lambda mu, _: Pois(log_rate=jnp.log(mu))
+                           emission_dist=lambda mu, _: Pois(log_rate=jnp.log(mu)))
 
     def _ssm_filter(self, params, emissions, inputs):
         """The filter of the corresponding SSM model"""
