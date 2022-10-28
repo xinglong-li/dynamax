@@ -5,7 +5,7 @@ from jax import vmap, jit
 from dynamax.distributions import InverseWishart as IW
 from dynamax.parameters import ParameterProperties as Prop
 from dynamax.structural_time_series.models.sts_ssm import GaussianSSM, PoissonSSM
-from dynamax.structural_time_series.sts_components import *
+from dynamax.structural_time_series.sts_components import STSRegression
 from dynamax.utils import PSDToRealBijector
 import optax
 import tensorflow_probability.substrates.jax.bijectors as tfb
