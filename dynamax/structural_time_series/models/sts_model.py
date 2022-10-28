@@ -5,7 +5,7 @@ from jax import vmap, jit
 from dynamax.distributions import InverseWishart as IW
 from dynamax.parameters import ParameterProperties as Prop
 from dynamax.structural_time_series.models.sts_ssm import GaussianSSM, PoissonSSM
-from dynamax.structural_time_series.sts_components import STSRegression
+from dynamax.structural_time_series.models.sts_components import *
 from dynamax.utils import PSDToRealBijector
 import optax
 import tensorflow_probability.substrates.jax.bijectors as tfb
@@ -55,14 +55,14 @@ class StructuralTimeSeries():
         self.obs_family = obs_distribution_family
 
         # Initialize paramters using the scale of observed time series
-        regression_term = None
-        obs_scale = jnp.std(jnp.abs(jnp.diff(obs_time_series, axis=0)), axis=0).mean()
+        regression = None
+        obs_scale = jnp.std(jnp.abs(jnp.diff(obs_time_series, axis=0)), axis=0)
         for c in components:
             if isinstance(c, STSRegression):
-                regression_term = c
-                regression_term.initialize(covariates, obs_time_series)
-                residuals = regression_term.fit(regression_term.params, covariates)
-                obs_scale = jnp.std(jnp.abs(jnp.diff(residuals, axis=0)), axis=0).mean()
+                regression = c
+                regression.initialize(covariates, obs_time_series)
+                residuals = regression.fit(regression.params, covariates)
+                obs_scale = jnp.std(jnp.abs(jnp.diff(residuals, axis=0)), axis=0)
         for c in components:
             if not isinstance(c, STSRegression):
                 c.initialize_params(obs_time_series[0], obs_scale)
@@ -70,7 +70,7 @@ class StructuralTimeSeries():
         # Aggeragate components
         self.initial_distributions = OrderedDict()
         self.param_props = OrderedDict()
-        self.priors = OrderedDict()
+        self.param_priors = OrderedDict()
         self.params = OrderedDict()
         self.trans_mat_getters = OrderedDict()
         self.trans_cov_getters = OrderedDict()
@@ -79,9 +79,9 @@ class StructuralTimeSeries():
 
         for c in components:
             if not isinstance(c, STSRegression):
-                self.initial_distributions[c.name](c.initial_distribution)
+                self.initial_distributions[c.name] = c.initial_distribution
                 self.param_props[c.name] = c.param_props
-                self.priors[c.name] = c.param_props
+                self.param_priors[c.name] = c.param_priors
                 self.params[c.name] = c.params
                 self.trans_mat_getters[c.name] = c.get_trans_mat
                 self.trans_cov_getters[c.name] = c.get_trans_cov
@@ -95,16 +95,16 @@ class StructuralTimeSeries():
                 obs_cov_prior = IW(df=self.dim_obs, scale=jnp.eye(self.dim_obs))
             if obs_cov is None:
                 obs_cov = obs_cov_prior.mode()
-            self.params['obs_cov'] = obs_cov
-            self.param_props['obs_cov'] = obs_cov_props
-            self.priors['obs_cov'] = obs_cov_prior
+            self.param_props['obs_model'] = OrderedDict({'cov': obs_cov_props})
+            self.param_priors['obs_model'] = OrderedDict({'cov': obs_cov_prior})
+            self.params['obs_model'] = OrderedDict({'cov': obs_cov})
 
         # Always put the regression term at the last position of the OrderedDict.
-        if regression_term is not None:
-            self.params[c.name] = c.params
-            self.param_props[c.name] = c.param_props
-            self.priors[c.name] = c.param_props
-            self.reg_func = c.fit
+        if regression is not None:
+            self.param_props[regression.name] = regression.param_props
+            self.param_priors[regression.name] = regression.param_priors
+            self.params[regression.name] = regression.params
+            self.reg_func = regression.fit
         else:
             self.reg_func = None
 
@@ -122,12 +122,12 @@ class StructuralTimeSeries():
         """
         if self.obs_family == 'Gaussian':
             sts_ssm = GaussianSSM(
-                self.param_props, self.priors, self.params,
+                self.param_props, self.param_priors, self.params,
                 self.trans_mat_getters, self.trans_cov_getters,
                 self.obs_mats, self.cov_select_mats, self.initial_distributions, self.reg_func)
         elif self.obs_family == 'Poisson':
             sts_ssm = PoissonSSM(
-                self.params, self.param_props, self.priors, self.get_trans_mat, self.get_obs_mat,
+                self.params, self.param_props, self.param_priors, self.get_trans_mat, self.get_obs_mat,
                 self.get_trans_cov, self.initial_mean, self.initial_cov, self.cov_select_mat)
         return sts_ssm
 
@@ -272,26 +272,27 @@ class StructuralTimeSeries():
             regression coefficient matrix (if the model has inputs and a regression component)
             covariance matrix of observations (if observations follow Gaussian distribution)
         """
+        # Initialize via fit MLE
         sts_ssm = self.as_ssm()
         param_samps = sts_ssm.fit_hmc(key, sample_size, observed_time_series, inputs,
                                       warmup_steps, num_integration_steps)
         return param_samps
 
-    def fit_mle(self, observed_time_series, inputs=None, num_steps=1000,
+    def fit_mle(self, obs_time_series, covariates=None, num_steps=1000,
                 initial_params=None, optimizer=optax.adam(1e-1), key=jr.PRNGKey(0)):
         """Maximum likelihood estimate of parameters of the STS model
         """
         sts_ssm = self.as_ssm()
 
-        batch_emissions = jnp.array([observed_time_series])
-        if inputs is not None:
-            inputs = jnp.array([inputs])
+        batch_obs = jnp.array([obs_time_series])
+        if covariates is not None:
+            covariates = jnp.array([covariates])
         curr_params = sts_ssm.params if initial_params is None else initial_params
         param_props = sts_ssm.param_props
 
         optimal_params, losses = sts_ssm.fit_sgd(
-            curr_params, param_props, batch_emissions, num_epochs=num_steps,
-            key=key, inputs=inputs, optimizer=optimizer)
+            curr_params, param_props, batch_obs, num_epochs=num_steps,
+            key=key, covariates=covariates, optimizer=optimizer)
 
         return optimal_params, losses
 

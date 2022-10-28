@@ -4,7 +4,7 @@ from dynamax.distributions import (
     InverseWishart as IW, MatrixNormalPrecision as MNP)
 from dynamax.parameters import ParameterProperties as Prop
 from dynamax.utils import PSDToRealBijector
-from jax import jit
+from jax import lax
 import jax.numpy as jnp
 from tensorflow_probability.substrates.jax.distributions import (
     MultivariateNormalFullCovariance as MVN,
@@ -34,7 +34,7 @@ class STSComponent(ABC):
     param_props (OrderedDict): properties of each item in 'params'.
         Each item is an instance of ParameterProperties, which specifies constrainer
         of the parameter and whether the parameter is trainable.
-    priors (OrderedDict): prior distributions for each item in 'params'.
+    param_priors (OrderedDict): prior distributions for each item in 'params'.
     """
 
     def __init__(self, name, dim_obs=1):
@@ -43,7 +43,7 @@ class STSComponent(ABC):
         self.initial_distribution = None
 
         self.param_props = OrderedDict()
-        self.priors = OrderedDict()
+        self.param_priors = OrderedDict()
         self.params = OrderedDict()
 
     @abstractmethod
@@ -106,16 +106,16 @@ class STSRegression(ABC):
     param_props (OrderedDict): properties of each item in 'params'.
         Each item is an instance of ParameterProperties, which specifies constrainer
         of the parameter and whether the parameter is trainable.
-    priors (OrderedDict): prior distributions for each item in 'params'.
+    param_priors (OrderedDict): prior distributions for each item in 'params'.
     """
 
     def __init__(self, name, dim_obs=1):
         self.name = name
         self.dim_obs = dim_obs
 
-        self.params = OrderedDict()
         self.param_props = OrderedDict()
-        self.priors = OrderedDict()
+        self.param_priors = OrderedDict()
+        self.params = OrderedDict()
 
     @abstractmethod
     def initialize(self, covariates, obs_time_series):
@@ -172,15 +172,15 @@ class LocalLinearTrend(STSComponent):
         self.initial_distribution = MVN(jnp.zeros(2*dim_obs), jnp.eye(2*dim_obs))
 
         self.param_props['cov_level'] = Prop(trainable=True, constrainer=RealToPSD)
-        self.priors['cov_level'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
-        self.params['cov_level'] = self.priors['cov_level'].mode()
+        self.param_priors['cov_level'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['cov_level'] = self.param_priors['cov_level'].mode()
 
         self.param_props['cov_slope'] = Prop(trainable=True, constrainer=RealToPSD)
-        self.priors['cov_slope'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
-        self.params['cov_slope'] = self.priors['cov_slope'].mode()
+        self.param_priors['cov_slope'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['cov_slope'] = self.param_priors['cov_slope'].mode()
 
         # The local linear trend component has a fixed transition matrix.
-        self._tran_mat = jnp.kron(jnp.array([[1, 1], [0, 1]]), jnp.eye(dim_obs))
+        self._trans_mat = jnp.kron(jnp.array([[1, 1], [0, 1]]), jnp.eye(dim_obs))
 
         # Fixed observation matrix.
         self._obs_mat = jnp.kron(jnp.array([1, 0]), jnp.eye(dim_obs))
@@ -196,15 +196,14 @@ class LocalLinearTrend(STSComponent):
         self.initial_distribution = MVN(initial_mean, initial_cov)
 
         # Initialize parameters.
-        self.priors['cov_level'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
-        self.params['cov_level'] = self.priors['cov_level'].mode()
-        self.priors['cov_slope'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
-        self.params['cov_slope'] = self.priors['cov_slope'].mode()
+        self.param_priors['cov_level'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['cov_level'] = self.param_priors['cov_level'].mode()
+        self.param_priors['cov_slope'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['cov_slope'] = self.param_priors['cov_slope'].mode()
 
     def get_trans_mat(self, params, t):
         return self._trans_mat
 
-    @jit
     def get_trans_cov(self, params, t):
         _shape = params['cov_level'].shape
         return jnp.block([[params['cov_level'], jnp.zeros(_shape)],
@@ -232,12 +231,12 @@ class Autoregressive(STSComponent):
         self.initial_distribution = MVN(jnp.zeros(p*dim_obs), jnp.eye(p*dim_obs))
 
         self.param_props['cov_level'] = Prop(trainable=True, constrainer=RealToPSD)
-        self.priors['cov_level'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
-        self.params['cov_level'] = self.priors['cov_level'].mode()
+        self.param_priors['cov_level'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['cov_level'] = self.param_priors['cov_level'].mode()
 
         self.param_props['coef'] = Prop(trainable=True, constrainer=tfb.Tanh())
-        self.priors['coef'] = MVNDiag(loc=jnp.zeros(p), scale_diag=jnp.ones(p))
-        self.params['coef'] = self.priors['coef'].mode
+        self.param_priors['coef'] = MVNDiag(loc=jnp.zeros(p), scale_diag=jnp.ones(p))
+        self.params['coef'] = self.param_priors['coef'].mode
 
         # Fixed observation matrix.
         self._obs_mat = jnp.kron(jnp.eye(p)[0], jnp.eye(dim_obs))
@@ -253,12 +252,11 @@ class Autoregressive(STSComponent):
         self.initial_distribution = MVN(initial_mean, initial_cov)
 
         # Initialize parameters.
-        self.priors['cov_level'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
-        self.params['cov_level'] = self.priors['cov_level'].mode()
-        self.priors['coef'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
-        self.params['coef'] = self.priors['cov_slope'].mode()
+        self.param_priors['cov_level'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['cov_level'] = self.param_priors['cov_level'].mode()
+        self.param_priors['coef'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['coef'] = self.param_priors['cov_slope'].mode()
 
-    @jit
     def get_trans_mat(self, params, t):
         if self.order == 1:
             trans_mat = params['coef'][:, None]
@@ -267,7 +265,6 @@ class Autoregressive(STSComponent):
                 (params['coef'][:, None], jnp.eye(self.order)[:, :-1]), axis=1)
         return jnp.kron(trans_mat, jnp.eye(self.dim_obs))
 
-    @jit
     def get_trans_cov(self, params, t):
         return params['cov_level']
 
@@ -321,19 +318,18 @@ class SeasonalDummy(STSComponent):
         self.initial_distribution = MVN(jnp.zeros(_c*dim_obs), jnp.eye(_c*dim_obs))
 
         self.param_props['drift_cov'] = Prop(trainable=True, constrainer=RealToPSD)
-        self.priors['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
-        self.params['drift_cov'] = self.priors['drift_cov'].mode()
+        self.param_priors['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.param_priors['drift_cov'].mode()
 
         # The seasonal component has a fixed transition matrix.
-        self._trans_mat = jnp.kron(jnp.block([[-jnp.ones(_c)],
-                                              [jnp.eye(_c-1), jnp.zeros((_c-1, 1))]]),
+        self._trans_mat = jnp.kron(jnp.concatenate((-jnp.ones((1, _c)), jnp.eye(_c)[:-1]), axis=0),
                                    jnp.eye(dim_obs))
 
         # Fixed observation matrix.
         self._obs_mat = jnp.kron(jnp.eye(_c)[0], jnp.eye(dim_obs))
 
         # Covariance selection matrix.
-        self._cov_select_mat = jnp.kron(jnp.eye(_c)[:, 0], jnp.eye(dim_obs))
+        self._cov_select_mat = jnp.kron(jnp.eye(_c)[:, [0]], jnp.eye(dim_obs))
 
     def initialize_params(self, obs_initial, obs_scale):
         # Initialize the distribution of the initial state.
@@ -343,26 +339,33 @@ class SeasonalDummy(STSComponent):
         self.initial_distribution = MVN(initial_mean, initial_cov)
 
         # Initialize parameters.
-        self.priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
-        self.params['drift_cov'] = self.priors['drift_cov'].mode()
+        self.param_priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.param_priors['drift_cov'].mode()
 
-    @jit
+    # def get_trans_mat(self, params, t):
+    #     update = (t % self.steps_per_season == 0)
+    #     if update:
+    #         return self._trans_mat
+    #     else:
+    #         return jnp.eye((self.num_seasons-1) * self.dim_obs)
+
+    # def get_trans_cov(self, params, t):
+    #     update = (t % self.steps_per_season == 0)
+    #     if update:
+    #         return params['drift_cov']
+    #     else:
+    #         return jnp.zeros((self.dim_obs, self.dim_obs))
     def get_trans_mat(self, params, t):
-        update = (t % self.steps_per_season == 0)
-        if update:
-            return self._trans_mat
-        else:
-            return jnp.eye((self.num_seasons-1) * self.dim_obs)
+        return lax.cond(t % self.steps_per_season == 0,
+                        lambda: self._trans_mat,
+                        lambda: jnp.eye((self.num_seasons-1)*self.dim_obs))
 
-    @jit
     def get_trans_cov(self, params, t):
-        update = (t % self.steps_per_season == 0)
-        if update:
-            return params['drift_cov']
-        else:
-            return jnp.zeros((self.dim_obs, self.dim_obs))
+        return lax.cond(t % self.steps_per_season == 0,
+                        lambda: params['drift_cov'],
+                        lambda: jnp.zeros((self.dim_obs, self.dim_obs)))
 
-    @jit
+    @property
     def obs_mat(self):
         return self._obs_mat
 
@@ -410,14 +413,14 @@ class SeasonalTrig(STSComponent):
         super().__init__(name=name, dim_obs=dim_obs)
 
         self.num_seasons = num_seasons
-        self.num_steps_per_season = num_steps_per_season
+        self.steps_per_season = num_steps_per_season
 
         _c = num_seasons - 1
         self.initial_distribution = MVN(jnp.zeros(_c*dim_obs), jnp.eye(_c*dim_obs))
 
-        self.params['drift_cov'] = Prop(trainable=True, constrainer=RealToPSD)
-        self.params['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
-        self.priors['drift_cov'] = self.priors['drift_cov'].mode()
+        self.param_props['drift_cov'] = Prop(trainable=True, constrainer=RealToPSD)
+        self.param_priors['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.param_priors['drift_cov'].mode()
 
         # The seasonal component has a fixed transition matrix.
         num_pairs = int(jnp.floor(num_seasons/2))
@@ -448,10 +451,9 @@ class SeasonalTrig(STSComponent):
         self.initial_distribution = MVN(initial_mean, initial_cov)
 
         # Initialize parameters.
-        self.priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
-        self.params['drift_cov'] = self.priors['drift_cov'].mode()
+        self.param_priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.param_priors['drift_cov'].mode()
 
-    @jit
     def get_trans_mat(self, params, t):
         update = (t % self.steps_per_season == 0)
         if update:
@@ -459,7 +461,6 @@ class SeasonalTrig(STSComponent):
         else:
             return jnp.eye((self.num_seasons-1) * self.dim_obs)
 
-    @jit
     def get_trans_cov(self, params, t):
         update = (t % self.steps_per_season == 0)
         if update:
@@ -467,7 +468,7 @@ class SeasonalTrig(STSComponent):
         else:
             return jnp.zeros((self.dim_obs, self.dim_obs))
 
-    @jit
+    @property
     def obs_mat(self):
         return self._obs_mat
 
@@ -510,17 +511,17 @@ class Cycle(STSComponent):
 
         # Parameters of the component
         self.param_props['damp'] = Prop(trainable=True, constrainer=tfb.Sigmoid())
-        self.priors['damp'] = Uniform(low=0., high=1.)
-        self.params['damp'] = self.priors['damp'].mode()
+        self.param_priors['damp'] = Uniform(low=0., high=1.)
+        self.params['damp'] = self.param_priors['damp'].mode()
 
         self.param_props['frequency'] = Prop(trainable=True,
                                              constrainer=tfb.Sigmoid(low=0., high=2*jnp.pi))
-        self.priors['frequency'] = Uniform(low=0., high=2*jnp.pi)
-        self.params['frequency'] = self.priors['frequency'].mode()
+        self.param_priors['frequency'] = Uniform(low=0., high=2*jnp.pi)
+        self.params['frequency'] = self.param_priors['frequency'].mode()
 
         self.param_props['drift_cov'] = Prop(trainable=True, constrainer=RealToPSD)
-        self.priors['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
-        self.params['drift_cov'] = self.priors['drift_cov'].mode()
+        self.param_priors['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.param_priors['drift_cov'].mode()
 
         # Fixed observation matrix.
         self._obs_mat = jnp.kron(jnp.array([1, 0]), jnp.eye(dim_obs))
@@ -536,14 +537,9 @@ class Cycle(STSComponent):
         self.initial_distribution = MVN(initial_mean, initial_cov)
 
         # Initialize parameters.
-        self.priors['damp'] = None
-        self.params['damp'] = self.priors['damp'].mode()
-        self.priors['frequency'] = None
-        self.params['frequency'] = self.priors['frequency'].mode()
-        self.priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
-        self.params['drift_cov'] = self.priors['drift_cov'].mode()
+        self.param_priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.param_priors['drift_cov'].mode()
 
-    @jit
     def get_trans_mat(self, params, t):
         freq = params['frequency']
         damp = params['damp']
@@ -552,11 +548,10 @@ class Cycle(STSComponent):
         trans_mat = damp * _trans_mat
         return jnp.kron(trans_mat, jnp.eye(self.dim_obs))
 
-    @jit
     def get_trans_cov(self, params, t):
         return params['drift_cov']
 
-    @jit
+    @property
     def obs_mat(self):
         return self._obs_mat
 
@@ -584,9 +579,9 @@ class LinearRegression(STSRegression):
         dim_inputs = dim_covariates + 1 if add_bias else dim_covariates
 
         self.param_props['weights'] = Prop(trainable=True, constrainer=tfb.Identity())
-        self.priors['weights'] = MNP(loc=jnp.zeros((dim_inputs, dim_obs)),
-                                     row_covariance=jnp.eye(dim_inputs),
-                                     col_precision=jnp.eye(dim_obs))
+        self.param_priors['weights'] = MNP(loc=jnp.zeros((dim_inputs, dim_obs)),
+                                           row_covariance=jnp.eye(dim_inputs),
+                                           col_precision=jnp.eye(dim_obs))
         self.params['weights'] = jnp.zeros((dim_inputs, dim_obs))
 
     def initialize(self, covariates, obs_time_series):
