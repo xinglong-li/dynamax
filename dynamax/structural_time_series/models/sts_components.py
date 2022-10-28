@@ -2,8 +2,8 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dynamax.distributions import (
     InverseWishart as IW, MatrixNormalPrecision as MNP)
-from dynamax.utils import PSDToRealBijector
 from dynamax.parameters import ParameterProperties as Prop
+from dynamax.utils import PSDToRealBijector
 from jax import jit
 import jax.numpy as jnp
 from tensorflow_probability.substrates.jax.distributions import (

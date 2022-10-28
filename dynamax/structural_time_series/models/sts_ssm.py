@@ -51,21 +51,20 @@ class _StructuralTimeSeriesSSM(SSM):
     """
 
     def __init__(self,
-                 params,
                  param_props,
                  priors,
+                 params,
                  trans_mat_getters,
-                 obs_mat_getters,
                  trans_cov_getters,
-                 initial_distributions,
-                 cov_select_mat,
-                 regression_comp):
+                 obs_mats,
+                 cov_select_mats,
+                 initial_distributions):
         self.params = params
         self.param_props = param_props
         self.param_priors = priors
 
         self.component_init_dists = initial_distributions
-        self.cov_select_mat = cov_select_mat
+        self.cov_select_mats = cov_select_mats
 
         self.trans_mat_getters = OrderedDict()
         self.obs_mat_getters = OrderedDict()
