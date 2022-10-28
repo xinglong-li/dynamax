@@ -595,7 +595,7 @@ class LinearRegression(STSRegression):
         W = jnp.solve(inputs.T @ inputs, inputs.T @ obs_time_series)
         self.params['weights'] = W
 
-    def fitted_values(self, params, covariates):
+    def fit(self, params, covariates):
         if self.add_bias:
             return params['weights'] @ jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)))
         else:

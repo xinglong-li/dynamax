@@ -60,12 +60,12 @@ class StructuralTimeSeries():
         for c in components:
             if isinstance(c, STSRegression):
                 regression_term = c
-                regression_term.initialize()
-                residuals = regression_term.fitted_values(regression_term.params, covariates)
+                regression_term.initialize(covariates, obs_time_series)
+                residuals = regression_term.fit(regression_term.params, covariates)
                 obs_scale = jnp.std(jnp.abs(jnp.diff(residuals, axis=0)), axis=0).mean()
         for c in components:
             if not isinstance(c, STSRegression):
-                c.initialize_params(obs_scale)
+                c.initialize_params(obs_time_series[0], obs_scale)
 
         # Aggeragate components
         self.initial_distributions = OrderedDict()
@@ -88,21 +88,25 @@ class StructuralTimeSeries():
                 self.obs_mats[c.name] = c.obs_mat
                 self.cov_select_mats[c.name] = c.cov_select_mat
 
-        if obs_cov_props is None:
-            obs_cov_props = Prop(trainable=True, constrainer=RealToPSD)
-        if obs_cov_prior is None:
-            obs_cov_prior = IW(df=self.dim_obs, scale=jnp.eye(self.dim_obs))
-        if obs_cov is None:
-            obs_cov = obs_cov_prior.mode()
-        self.params['obs_cov'] = obs_cov
-        self.param_props['obs_cov'] = obs_cov_props
-        self.priors['obs_cov'] = obs_cov_prior
+        if self.obs_family == 'Gaussian':
+            if obs_cov_props is None:
+                obs_cov_props = Prop(trainable=True, constrainer=RealToPSD)
+            if obs_cov_prior is None:
+                obs_cov_prior = IW(df=self.dim_obs, scale=jnp.eye(self.dim_obs))
+            if obs_cov is None:
+                obs_cov = obs_cov_prior.mode()
+            self.params['obs_cov'] = obs_cov
+            self.param_props['obs_cov'] = obs_cov_props
+            self.priors['obs_cov'] = obs_cov_prior
 
         # Always put the regression term at the last position of the OrderedDict.
         if regression_term is not None:
             self.params[c.name] = c.params
             self.param_props[c.name] = c.param_props
             self.priors[c.name] = c.param_props
+            self.reg_func = c.fit
+        else:
+            self.reg_func = None
 
     def as_ssm(self):
         """Formulate the STS model as a linear Gaussian state space model:
@@ -120,7 +124,7 @@ class StructuralTimeSeries():
             sts_ssm = GaussianSSM(
                 self.param_props, self.priors, self.params,
                 self.trans_mat_getters, self.trans_cov_getters,
-                self.obs_mats, self.cov_select_mats, self.initial_distributions)
+                self.obs_mats, self.cov_select_mats, self.initial_distributions, self.reg_func)
         elif self.obs_family == 'Poisson':
             sts_ssm = PoissonSSM(
                 self.params, self.param_props, self.priors, self.get_trans_mat, self.get_obs_mat,
