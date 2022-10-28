@@ -1,12 +1,15 @@
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from dynamax.distributions import InverseWishart as IW
+from dynamax.distributions import (
+    InverseWishart as IW, MatrixNormalPrecision as MNP)
 from dynamax.utils import PSDToRealBijector
 from dynamax.parameters import ParameterProperties as Prop
 from jax import jit
 import jax.numpy as jnp
 from tensorflow_probability.substrates.jax.distributions import (
-    MultivariateNormalFullCovariance as MVN)
+    MultivariateNormalFullCovariance as MVN,
+    MultivariateNormalDiag as MVNDiag,
+    Uniform)
 import tensorflow_probability.substrates.jax.bijectors as tfb
 
 
@@ -216,6 +219,67 @@ class LocalLinearTrend(STSComponent):
         return self._cov_select_mat
 
 
+class Autoregressive(STSComponent):
+    """The autoregressive component of the structural time series (STS) model.
+
+    Args (in addition to name and dim_obs):
+        p (int): the autoregressive order
+    """
+    def __init__(self, p, dim_obs=1, name='ar'):
+        super().__init__(name=name, dim_obs=dim_obs)
+
+        self.order = p
+        self.initial_distribution = MVN(jnp.zeros(p*dim_obs), jnp.eye(p*dim_obs))
+
+        self.param_props['cov_level'] = Prop(trainable=True, constrainer=RealToPSD)
+        self.priors['cov_level'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['cov_level'] = self.priors['cov_level'].mode()
+
+        self.param_props['coef'] = Prop(trainable=True, constrainer=tfb.Tanh())
+        self.priors['coef'] = MVNDiag(loc=jnp.zeros(p), scale_diag=jnp.ones(p))
+        self.params['coef'] = self.priors['coef'].mode
+
+        # Fixed observation matrix.
+        self._obs_mat = jnp.kron(jnp.eye(p)[0], jnp.eye(dim_obs))
+
+        # Covariance selection matrix.
+        self._cov_select_mat = jnp.kron(jnp.eye(p)[:, 0], jnp.eye(dim_obs))
+
+    def initialize_params(self, obs_initial, obs_scale):
+        # Initialize the distribution of the initial state.
+        dim_obs = len(obs_initial)
+        initial_mean = jnp.concatenate((obs_initial, jnp.zeros(dim_obs)))
+        initial_cov = jnp.kron(jnp.eye(2), jnp.diag(obs_scale**2))
+        self.initial_distribution = MVN(initial_mean, initial_cov)
+
+        # Initialize parameters.
+        self.priors['cov_level'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['cov_level'] = self.priors['cov_level'].mode()
+        self.priors['coef'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['coef'] = self.priors['cov_slope'].mode()
+
+    @jit
+    def get_trans_mat(self, params, t):
+        if self.order == 1:
+            trans_mat = params['coef'][:, None]
+        else:
+            trans_mat = jnp.concatenate(
+                (params['coef'][:, None], jnp.eye(self.order)[:, :-1]), axis=1)
+        return jnp.kron(trans_mat, jnp.eye(self.dim_obs))
+
+    @jit
+    def get_trans_cov(self, params, t):
+        return params['cov_level']
+
+    @property
+    def obs_mat(self):
+        return self._obs_mat
+
+    @property
+    def cov_select_mat(self):
+        return self._cov_select_mat
+
+
 class SeasonalDummy(STSComponent):
     """The (dummy) seasonal component of the structual time series (STS) model
 
@@ -365,13 +429,13 @@ class SeasonalTrig(STSComponent):
             _trans_mat = _trans_mat.at[2*(j-1):2*j, 2*(j-1):2*j].set(block_j)
         if num_seasons % 2 == 0:
             _trans_mat = _trans_mat[:-1, :-1]
-        self._trans_mat = _trans_mat
+        self._trans_mat = jnp.kron(_trans_mat, jnp.eye(dim_obs))
 
         # Fixed observation matrix.
         _obs_mat = jnp.tile(jnp.array([1, 0]), num_pairs)
         if num_seasons % 2 == 0:
             _obs_mat = _obs_mat[:-1]
-        self._obs_mat = _obs_mat[None, :]
+        self._obs_mat = jnp.kron(_obs_mat, jnp.eye(dim_obs))
 
         # Covariance selection matrix.
         self._cov_select_mat = jnp.eye(_c*dim_obs)
@@ -412,6 +476,95 @@ class SeasonalTrig(STSComponent):
         return self._cov_select_mat
 
 
+class Cycle(STSComponent):
+    """The cycle component of the structural time series model.
+
+    The cycle effect (random) of next time step takes the form:
+
+        \gamma_t = cos(freq) + sin(freq)
+
+    where
+
+        \gamma_{t+1}  =  cos(freq) \gamma_t + sin(freq) \gamma*_t  + w_t
+        \gamma*_{t+1} = -sin(freq) \gamma_t + cos(freq) \gamma*_t  + w*_t
+
+    The last term w_t, w^*_t are stochastic noises of the cycle effect following
+    a normal distribution with mean zeros and a common covariance drift_cov for all t.
+
+    The latent state corresponding to the cycle component has dimension 2 * dim_obs.
+
+    If dim_obs = 1:
+
+        trans_mat_j = damp * |  cos(freq), sin(freq) |    obs_mat_j = [ 1, 0 ]
+                             | -sin(freq), cos(freq) |,
+
+    damp (scalar): damping factor, 0 < damp <1.
+    freq (scalar): frequency factor, 0 < freq < 2\pi,
+        therefore the period of cycle is 2\pi/freq.
+    """
+
+    def __init__(self, dim_obs=1, name='cycle'):
+        super().__init__(name=name, dim_obs=dim_obs)
+
+        self.initial_distribution = MVN(jnp.zeros(2*dim_obs), jnp.eye(2*dim_obs))
+
+        # Parameters of the component
+        self.param_props['damp'] = Prop(trainable=True, constrainer=tfb.Sigmoid())
+        self.priors['damp'] = Uniform(low=0., high=1.)
+        self.params['damp'] = self.priors['damp'].mode()
+
+        self.param_props['frequency'] = Prop(trainable=True,
+                                             constrainer=tfb.Sigmoid(low=0., high=2*jnp.pi))
+        self.priors['frequency'] = Uniform(low=0., high=2*jnp.pi)
+        self.params['frequency'] = self.priors['frequency'].mode()
+
+        self.param_props['drift_cov'] = Prop(trainable=True, constrainer=RealToPSD)
+        self.priors['drift_cov'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.priors['drift_cov'].mode()
+
+        # Fixed observation matrix.
+        self._obs_mat = jnp.kron(jnp.array([1, 0]), jnp.eye(dim_obs))
+
+        # Covariance selection matrix.
+        self._cov_select_mat = jnp.kron(jnp.array([[1], [0]]), jnp.eye(dim_obs))
+
+    def initialize_params(self, obs_initial, obs_scale):
+        # Initialize the distribution of the initial state.
+        dim_obs = len(obs_initial)
+        initial_mean = jnp.zeros((self.num_seasons-1) * dim_obs)
+        initial_cov = jnp.kron(jnp.eye(self.num_seasons-1), jnp.diag(obs_scale**2))
+        self.initial_distribution = MVN(initial_mean, initial_cov)
+
+        # Initialize parameters.
+        self.priors['damp'] = None
+        self.params['damp'] = self.priors['damp'].mode()
+        self.priors['frequency'] = None
+        self.params['frequency'] = self.priors['frequency'].mode()
+        self.priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
+        self.params['drift_cov'] = self.priors['drift_cov'].mode()
+
+    @jit
+    def get_trans_mat(self, params, t):
+        freq = params['frequency']
+        damp = params['damp']
+        _trans_mat = jnp.array([[jnp.cos(freq), jnp.sin(freq)],
+                                [-jnp.sin(freq), jnp.cos(freq)]])
+        trans_mat = damp * _trans_mat
+        return jnp.kron(trans_mat, jnp.eye(self.dim_obs))
+
+    @jit
+    def get_trans_cov(self, params, t):
+        return params['drift_cov']
+
+    @jit
+    def obs_mat(self):
+        return self._obs_mat
+
+    @property
+    def cov_select_mat(self):
+        return self._cov_select_mat
+
+
 class LinearRegression(STSRegression):
     """The linear regression component of the structural time series (STS) model.
 
@@ -430,9 +583,11 @@ class LinearRegression(STSRegression):
 
         dim_inputs = dim_covariates + 1 if add_bias else dim_covariates
 
+        self.param_props['weights'] = Prop(trainable=True, constrainer=tfb.Identity())
+        self.priors['weights'] = MNP(loc=jnp.zeros((dim_inputs, dim_obs)),
+                                     row_covariance=jnp.eye(dim_inputs),
+                                     col_precision=jnp.eye(dim_obs))
         self.params['weights'] = jnp.zeros((dim_inputs, dim_obs))
-        self.param_props['weights'] = None
-        self.priors['weights'] = None
 
     def initialize(self, covariates, obs_time_series):
         if self.add_bias:
@@ -445,104 +600,3 @@ class LinearRegression(STSRegression):
             return params['weights'] @ jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)))
         else:
             return params['weights'] @ covariates
-
-
-class Cycle(STSComponent):
-    """The cycle component of the structural time series model
-
-    Args:
-        damp (array(dim_ts)): damping factor
-        frequency (array(dim_ts)): frequency factor
-    """
-
-    def __init__(self, damp=None, frequency=None, covariance=None, dim_obs=1, name='cycle'):
-        if damp is not None:
-            dim_obs = len(damp)
-            assert all(damp > 0.) and all(damp < 1.), "The damping factor shoul be in range (0, 1)."
-
-        super().__init__(name=name, dim_obs=dim_obs)
-
-        self.initial_distribution = None
-
-        # Parameters of the component
-        self.params['damp'] = damp
-        self.param_props['damp'] = None
-        self.priors['damp'] = None
-
-        self.params['frequency'] = frequency
-        self.param_props['frequency'] = None
-        self.priors['frequency'] = None
-
-        self.params['cov'] = covariance
-        self.param_props['cov'] = None
-        self.priors['cov'] = None
-
-    def initialize_params(self, obs_scale):
-        raise NotImplementedError
-
-    @jit
-    def get_trans_mat(self, params, t):
-        damp = jnp.diag(self.params['damp'])
-        cos_fr = jnp.diag(jnp.cos(self.params['frequency']))
-        sin_fr = jnp.diag(jnp.sin(self.params['frequency']))
-        return jnp.block([[damp*cos_fr, damp*sin_fr],
-                          [-damp*sin_fr, damp*cos_fr]])
-
-    @jit
-    def get_trans_cov(self):
-        Q = self.params['cov']
-        return jnp.block([[Q, jnp.zeros_like(Q)],
-                          [jnp.zeros_like(Q), Q]])
-
-    @jit
-    def obs_mat(self):
-        return jnp.block([jnp.eye(self.dim_obs), jnp.zeros(self.dim_obs, self.dim_obs)])
-
-    @property
-    def cov_select_mat(self):
-        raise NotImplementedError
-
-
-class Autoregressive(STSComponent):
-    """The autoregressive component of the structural time series (STS) model.
-
-    Args:
-
-    """
-    def __init__(self, p, dim_obs=1, name='ar'):
-        super().__init__(name=name, dim_obs=dim_obs)
-
-        self.initial_distribution = None
-        self.params = OrderedDict()
-        self.params['coef'] = None
-        self.params['noise_cov'] = None
-        self.param_props = OrderedDict()
-        self.priors = OrderedDict()
-
-        self._obs_mat = jnp.block(
-            [jnp.eye(self.dim_obs), jnp.zeros((self.dim_obs, (self.num_seasons-2)*self.dim_obs))])
-
-    def initialize_params(self, obs_scale):
-        return
-
-    @jit
-    def get_trans_mat(self, cur_params, t):
-        phi = cur_params['coef']
-        order = len(phi)
-        if order > 1:
-            m = jnp.block([phi[:, None], jnp.vstack((jnp.eye(order-1), jnp.zeros((order-1, 1))))])
-        else:
-            m = phi[None, :]
-        return jnp.kron(m, jnp.eye(self.dim_obs))
-
-    @jit
-    def get_trans_cov(self, cur_params, t):
-        return self.params['noise_cov']
-
-    @property
-    def cov_select_mat(self):
-        raise NotImplementedError
-
-    @jit
-    def obs_mat(self):
-        return self._obs_mat
