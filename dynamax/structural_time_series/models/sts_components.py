@@ -342,19 +342,6 @@ class SeasonalDummy(STSComponent):
         self.param_priors['drift_cov'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
         self.params['drift_cov'] = self.param_priors['drift_cov'].mode()
 
-    # def get_trans_mat(self, params, t):
-    #     update = (t % self.steps_per_season == 0)
-    #     if update:
-    #         return self._trans_mat
-    #     else:
-    #         return jnp.eye((self.num_seasons-1) * self.dim_obs)
-
-    # def get_trans_cov(self, params, t):
-    #     update = (t % self.steps_per_season == 0)
-    #     if update:
-    #         return params['drift_cov']
-    #     else:
-    #         return jnp.zeros((self.dim_obs, self.dim_obs))
     def get_trans_mat(self, params, t):
         return lax.cond(t % self.steps_per_season == 0,
                         lambda: self._trans_mat,
@@ -455,18 +442,14 @@ class SeasonalTrig(STSComponent):
         self.params['drift_cov'] = self.param_priors['drift_cov'].mode()
 
     def get_trans_mat(self, params, t):
-        update = (t % self.steps_per_season == 0)
-        if update:
-            return self._trans_mat
-        else:
-            return jnp.eye((self.num_seasons-1) * self.dim_obs)
+        return lax.cond(t % self.steps_per_season == 0,
+                        lambda: self._trans_mat,
+                        lambda: jnp.eye((self.num_seasons-1)*self.dim_obs))
 
     def get_trans_cov(self, params, t):
-        update = (t % self.steps_per_season == 0)
-        if update:
-            return params['drift_cov']
-        else:
-            return jnp.zeros((self.dim_obs, self.dim_obs))
+        return lax.cond(t % self.steps_per_season == 0,
+                        lambda: params['drift_cov'],
+                        lambda: jnp.zeros((self.dim_obs, self.dim_obs)))
 
     @property
     def obs_mat(self):
