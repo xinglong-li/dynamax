@@ -316,62 +316,24 @@ class _StructuralTimeSeriesSSM(SSM):
             trans_cov.append(c_trans_cov)
         return jsp.linalg.block_diag(*trans_cov)
 
-    def _to_ssm_params(self, params):
+    def _to_ssm_params(self, params, obs_distribution):
         """Wrap the STS model into the form of the corresponding SSM model """
-        raise NotImplementedError
-
-    def _ssm_filter(self, params, emissions, inputs):
-        """The filter of the corresponding SSM model"""
-        raise NotImplementedError
-
-    def _ssm_smoother(self, params, emissions, inputs):
-        """The smoother of the corresponding SSM model"""
-        raise NotImplementedError
-
-    def _ssm_posterior_sample(self, key, ssm_params, observed_time_series, inputs):
-        """The posterior sampler of the corresponding SSM model"""
-        raise NotImplementedError
-
-    def _emission_constrainer(self, emission):
-        """Transform the state into the possibly constrained space."""
-        raise NotImplementedError
-
-
-#####################################################################
-# SSM classes for STS model with specific observation distributions #
-#####################################################################
-
-
-class GaussianSSM(_StructuralTimeSeriesSSM):
-    """SSM classes for STS model where the observations follow multivariate normal distributions.
-    """
-    def __init__(self,
-                 param_props,
-                 param_priors,
-                 params,
-                 trans_mat_getters,
-                 trans_cov_getters,
-                 obs_mats,
-                 cov_select_mats,
-                 initial_distributions,
-                 reg_func=None):
-
-        super().__init__(param_props, param_priors, params, trans_mat_getters, trans_cov_getters,
-                         obs_mats, cov_select_mats, initial_distributions, reg_func)
-
-    def emission_distribution(self, state, inputs):
-        return MVN(self.obs_mat @ state + inputs, self.params['obs_model']['cov'])
-
-    def forecast(self, key, observed_time_series, num_forecast_steps,
-                 past_inputs=None, forecast_inputs=None):
-        ts_means, ts_mean_covs, ts = super().forecast(
-            key, observed_time_series, num_forecast_steps, past_inputs, forecast_inputs)
-        ts_covs = ts_mean_covs + self.params['obs_model']['cov']
-        return ts_means, ts_covs, ts
-
-    def _to_ssm_params(self, params):
-        """Wrap the STS model into the form of the corresponding SSM model """
-        get_trans_mat = partial(self.get_trans_mat, params)
+        if obs_distribution == 'Gaussian':
+            return get_trans_mat = partial(self.get_trans_mat, params)
+        sparse_trans_cov = lambda t:\
+            self.cov_select_mat @ self.get_trans_cov(params, t) @ self.cov_select_mat.T
+        return LGSSMParams(initial_mean=self.initial_mean,
+                           initial_covariance=self.initial_cov,
+                           dynamics_matrix=get_trans_mat,
+                           dynamics_input_weights=jnp.zeros((self.dim_state, 1)),
+                           dynamics_bias=jnp.zeros(self.dim_state),
+                           dynamics_covariance=sparse_trans_cov,
+                           emission_matrix=self.obs_mat,
+                           emission_input_weights=jnp.eye(self.dim_obs),
+                           emission_bias=jnp.zeros(self.dim_obs),
+                           emission_covariance=params['obs_model']['cov'])
+        elif obs_distribution == 'Poisson':
+            return get_trans_mat = partial(self.get_trans_mat, params)
         sparse_trans_cov = lambda t:\
             self.cov_select_mat @ self.get_trans_cov(params, t) @ self.cov_select_mat.T
         return LGSSMParams(initial_mean=self.initial_mean,
@@ -385,94 +347,35 @@ class GaussianSSM(_StructuralTimeSeriesSSM):
                            emission_bias=jnp.zeros(self.dim_obs),
                            emission_covariance=params['obs_model']['cov'])
 
-    def _ssm_filter(self, params, emissions, inputs):
+    def _ssm_filter(self, params, emissions, inputs, obs_distribution):
         """The filter of the corresponding SSM model"""
-        return lgssm_filter(params=params, emissions=emissions, inputs=inputs)
+        if obs_distribution == 'Gaussian':
+            return lgssm_filter(params=params, emissions=emissions, inputs=inputs)
+        elif obs_distribution == 'Poisson':
+            return cmgf_filt(
+            params=params, inf_params=EKFIntegrals(), emissions=emissions, inputs=inputs, num_iter=2)
 
-    def _ssm_smoother(self, params, emissions, inputs):
-        """The filter of the corresponding SSM model"""
-        return lgssm_smoother(params=params, emissions=emissions, inputs=inputs)
+    def _ssm_smoother(self, params, emissions, inputs, obs_distribution):
+        """The smoother of the corresponding SSM model"""
+        if obs_distribution == 'Gaussian':
+            return lgssm_smoother(params=params, emissions=emissions, inputs=inputs)
+        elif obs_distribution == 'Poisson':
+            return cmgf_smooth(
+            params=params, inf_params=EKFIntegrals(), emissions=emissions, inputs=inputs, num_iter=2)
 
-    def _ssm_posterior_sample(self, key, ssm_params, observed_time_series, inputs):
+    def _ssm_posterior_sample(self, key, ssm_params, observed_time_series, inputs, obs_distribution):
         """The posterior sampler of the corresponding SSM model"""
-        return lgssm_posterior_sample(rng=key,
+        if obs_distribution == 'Gaussian':
+            return lgssm_posterior_sample(rng=key,
                                       params=ssm_params,
                                       emissions=observed_time_series,
                                       inputs=inputs)
+        elif obs_distribution == 'Poisson':
+            return self._ssm_filter(ssm_params, observed_time_series, inputs)
 
-    def _emission_constrainer(self, emission):
-        """Transform the state into the possibly constrained space.
-           Use identity transformation when the observation distribution is MVN.
-        """
-        return emission
-
-
-class PoissonSSM(_StructuralTimeSeriesSSM):
-    """SSM classes for STS model where the observations follow Poisson distributions.
-    """
-    def __init__(self,
-                 param_props,
-                 param_priors,
-                 params,
-                 trans_mat_getters,
-                 trans_cov_getters,
-                 obs_mats,
-                 cov_select_mats,
-                 initial_distributions,
-                 reg_func=None):
-
-        super().__init__(param_props, param_priors, params, trans_mat_getters, trans_cov_getters,
-                         obs_mats, cov_select_mats, initial_distributions, reg_func)
-
-    def emission_distribution(self, state, inputs):
-        log_rate = self.obs_mat @ state + inputs
-        return Pois(rate=self._emission_constrainer(log_rate))
-
-    def forecast(self, key, observed_time_series, num_forecast_steps,
-                 past_inputs=None, forecast_inputs=None):
-        ts_means, ts_mean_covs, ts = super().forecast(
-            key, observed_time_series, num_forecast_steps, past_inputs, forecast_inputs)
-        sampler = lambda r, key: Pois(rate=r).sample(seed=key)
-        ts_samples = vmap(sampler)(ts_means, jr.split(key, num_forecast_steps))
-        return ts_samples, ts_means, ts
-
-    def _to_ssm_params(self, params):
-        """Wrap the STS model into the form of the corresponding SSM model """
-        # NOTE: Currently the GGSSMParams does not depends on time poit t.
-        trans_mat = self.get_trans_mat(params, t=0)
-        sparse_trans_cov = self.cov_select_mat @ self.get_trans_cov(params, t=0) @ self.cov_select_mat.T
-        return GGSSMParams(initial_mean=self.initial_mean,
-                           initial_covariance=self.initial_cov,
-                           dynamics_function=lambda z: trans_mat @ z,
-                           dynamics_covariance=sparse_trans_cov,
-                           emission_mean_function=
-                               lambda z: self._emission_constrainer(self.obs_mat @ z),
-                           emission_cov_function=
-                               lambda z: jnp.diag(self._emission_constrainer(self.obs_mat @ z)),
-                           emission_dist=lambda mu, _: Pois(log_rate=jnp.log(mu)))
-
-    def _ssm_filter(self, params, emissions, inputs):
-        """The filter of the corresponding SSM model"""
-        return cmgf_filt(
-            params=params, inf_params=EKFIntegrals(), emissions=emissions, inputs=inputs, num_iter=2)
-
-    def _ssm_smoother(self, params, emissions, inputs):
-        """The filter of the corresponding SSM model"""
-        return cmgf_smooth(
-            params=params, inf_params=EKFIntegrals(), emissions=emissions, inputs=inputs, num_iter=2)
-
-    def _ssm_posterior_sample(self, key, ssm_params, observed_time_series, inputs):
-        """The posterior sampler of the corresponding SSM model"""
-        # TODO:
-        # Implement the real posteriror sample.
-        # Currently it simply returns the filtered means.
-        print('Currently the posterior_sample for STS model with Poisson likelihood\
-               simply returns the filtered means.')
-        return self._ssm_filter(ssm_params, observed_time_series, inputs)
-
-    def _emission_constrainer(self, emission):
-        """Transform the state into the possibly constrained space.
-        """
-        # Use the exponential function to transform the unconstrained rate
-        # to rate of the Poisson distribution
-        return jnp.exp(emission)
+    def _emission_constrainer(self, emission, obs_distribution):
+        """Transform the state into the possibly constrained space."""
+        if obs_distribution == 'Gaussian':
+            return jnp.exp(emission)
+        elif obs_distribution == 'Poisson':
+            return jnp.exp(emission)

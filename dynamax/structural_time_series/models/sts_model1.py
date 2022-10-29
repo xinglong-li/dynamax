@@ -120,15 +120,10 @@ class StructuralTimeSeries():
         the regression coefficient matrix B is also unknown random matrix
         if the STS model includes an regression component
         """
-        if self.obs_family == 'Gaussian':
-            sts_ssm = GaussianSSM(
+        sts_ssm = GaussianSSM(
                 self.param_props, self.param_priors, self.params,
                 self.trans_mat_getters, self.trans_cov_getters,
                 self.obs_mats, self.cov_select_mats, self.initial_distributions, self.reg_func)
-        elif self.obs_family == 'Poisson':
-            sts_ssm = PoissonSSM(
-                self.params, self.param_props, self.param_priors, self.get_trans_mat, self.get_obs_mat,
-                self.get_trans_cov, self.initial_mean, self.initial_cov, self.cov_select_mat)
         return sts_ssm
 
     def decompose_by_component(self, observed_time_series, inputs=None,
@@ -180,21 +175,6 @@ class StructuralTimeSeries():
                                  self.observation_regression_weights_prior)
             return sts_ssm.component_posterior(observed_time_series, inputs)
 
-        @jit
-        def decomp_gaussian(sts_param):
-            """Decompose one STS model if the observations follow Gaussian distributions.
-            """
-            sts_ssm = GaussianSSM(self.transition_matrices,
-                                  self.observation_matrices,
-                                  self.initial_state_priors,
-                                  sts_param['dynamics_covariances'],
-                                  self.transition_covariance_priors,
-                                  sts_param['emission_covariance'],
-                                  self.observation_covariance_prior,
-                                  self.cov_spars_matrices,
-                                  sts_param['regression_weights'],
-                                  self.observation_regression_weights_prior)
-            return sts_ssm.component_posterior(observed_time_series, inputs)
 
         # Obtain the smoothed posterior for each component given the parameters
         if self.obs_family == 'Gaussian':
@@ -226,19 +206,6 @@ class StructuralTimeSeries():
         return sts_ssm.marginal_log_prob(sts_ssm.params, observed_time_series, inputs)
 
     def posterior_sample(self, key, observed_time_series, sts_params, inputs=None):
-        @jit
-        def single_sample_poisson(sts_param):
-            sts_ssm = PoissonSSM(self.transition_matrices,
-                                 self.observation_matrices,
-                                 self.initial_state_priors,
-                                 sts_param['dynamics_covariances'],
-                                 self.transition_covariance_priors,
-                                 self.cov_spars_matrices,
-                                 sts_param['regression_weights'],
-                                 self.observation_regression_weights_prior
-                                 )
-            ts_means, ts = sts_ssm.posterior_sample(key, observed_time_series, inputs)
-            return [ts_means, ts]
 
         @jit
         def single_sample_gaussian(sts_param):
@@ -308,15 +275,6 @@ class StructuralTimeSeries():
                                                past_inputs, forecast_inputs)
             return [means, covs, ts]
 
-        @jit
-        def single_forecast_poisson(sts_param):
-            sts_ssm = PoissonSSM(
-                    self.param_props, self.param_priors, sts_param, self.trans_mat_getters,
-                    self.trans_cov_getters, self.obs_mats, self.cov_select_mats,
-                    self.initial_distributions, self.reg_func)
-            means, covs, ts = sts_ssm.forecast(key, observed_time_series, num_forecast_steps,
-                                               past_inputs, forecast_inputs)
-            return [means, covs, ts]
 
         if self.obs_family == 'Gaussian':
             forecasts = vmap(single_forecast_gaussian)(sts_params)
