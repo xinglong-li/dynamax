@@ -292,7 +292,7 @@ class StructuralTimeSeries():
 
         optimal_params, losses = sts_ssm.fit_sgd(
             curr_params, param_props, batch_emissions, num_epochs=num_steps,
-            key=key, inputs=inputs, optimizer=optimizer)
+            key=key, covariates=inputs, optimizer=optimizer)
 
         return optimal_params, losses
 

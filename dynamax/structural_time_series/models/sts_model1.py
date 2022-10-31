@@ -38,7 +38,7 @@ class StructuralTimeSeries():
     def __init__(self,
                  components,
                  obs_time_series,
-                 obs_distribution_family='Gaussian',
+                 obs_distribution='Gaussian',
                  obs_cov_props=None,
                  obs_cov_prior=None,
                  obs_cov=None,
@@ -47,12 +47,12 @@ class StructuralTimeSeries():
 
         names = [c.name for c in components]
         assert len(set(names)) == len(names), "Components should not share the same name."
-        assert obs_distribution_family in ['Gaussian', 'Poisson'],\
+        assert obs_distribution in ['Gaussian', 'Poisson'],\
             "The distribution of observations must be Gaussian or Poisson."
 
         self.name = name
         self.dim_obs = obs_time_series.shape[-1]
-        self.obs_family = obs_distribution
+        self.obs_distribution = obs_distribution
 
         # Initialize paramters using the scale of observed time series
         regression = None
@@ -88,11 +88,11 @@ class StructuralTimeSeries():
                 self.obs_mats[c.name] = c.obs_mat
                 self.cov_select_mats[c.name] = c.cov_select_mat
 
-        if self.obs_family == 'Gaussian':
+        if self.obs_distribution == 'Gaussian':
             if obs_cov_props is None:
                 obs_cov_props = Prop(trainable=True, constrainer=RealToPSD)
             if obs_cov_prior is None:
-                obs_cov_prior = IW(df=self.dim_obs, scale=jnp.eye(self.dim_obs))
+                obs_cov_prior = IW(df=self.dim_obs, scale=1e-3*obs_scale**2*jnp.eye(self.dim_obs))
             if obs_cov is None:
                 obs_cov = obs_cov_prior.mode()
             self.param_props['obs_model'] = OrderedDict({'cov': obs_cov_props})
@@ -123,8 +123,84 @@ class StructuralTimeSeries():
                                           self.obs_distribution)
         return sts_ssm
 
-    def decompose_by_component(self, observed_time_series, inputs=None,
-                               sts_params=None, num_post_samples=100, key=jr.PRNGKey(0)):
+    def sample(self, key, num_timesteps, inputs=None):
+        """Given parameters, sample latent states and corresponding observed time series.
+        """
+        sts_ssm = self.as_ssm()
+        states, timeseries = sts_ssm.sample(key, num_timesteps, inputs)
+        return timeseries
+
+    def marginal_log_prob(self, obs_time_series, inputs=None):
+        sts_ssm = self.as_ssm()
+        return sts_ssm.marginal_log_prob(sts_ssm.params, obs_time_series, inputs)
+
+    def fit_mle(self,
+                obs_time_series,
+                covariates=None,
+                num_steps=1000,
+                initial_params=None,
+                optimizer=optax.adam(1e-1),
+                key=jr.PRNGKey(0)):
+        """Maximum likelihood estimate of parameters of the STS model
+        """
+        sts_ssm = self.as_ssm()
+        batch_obs = jnp.array([obs_time_series])
+        if covariates is not None:
+            covariates = jnp.array([covariates])
+        curr_params = sts_ssm.params if initial_params is None else initial_params
+        param_props = sts_ssm.param_props
+
+        optimal_params, losses = sts_ssm.fit_sgd(
+            curr_params, param_props, batch_obs, num_epochs=num_steps,
+            key=key, covariates=covariates, optimizer=optimizer)
+
+        return optimal_params, losses
+
+    def fit_hmc(self,
+                num_samples,
+                obs_time_series,
+                covariates=None,
+                initial_params=None,
+                param_props=None,
+                warmup_steps=100,
+                verbose=True,
+                key=jr.PRNGKey(0)):
+        """Sample parameters of the STS model from their posterior distributions.
+
+        Parameters of the STS model includes:
+            covariance matrix of each component,
+            regression coefficient matrix (if the model has inputs and a regression component)
+            covariance matrix of observations (if observations follow Gaussian distribution)
+        """
+        sts_ssm = self.as_ssm()
+        # Initialize via fit MLE if initial params is not given.
+        if initial_params is None:
+            initial_params = self.fit_mle(obs_time_series, covariates, num_steps=500)
+        if param_props is None:
+            param_props = self.param_props
+
+        param_samps = sts_ssm.fit_hmcfit_hmc(
+            initial_params, param_props, key, num_samples, obs_time_series, covariates,
+            warmup_steps, verbose)
+        return param_samps
+
+    def posterior_sample(self, key, obs_time_series, sts_params, inputs=None):
+        """Sample latent states given model parameters."""
+        @jit
+        def single_sample(sts_param):
+            sts_ssm = StructuralTimeSeriesSSM(
+                sts_param, self.param_props, self.param_priors,
+                self.trans_mat_getters, self.trans_cov_getters, self.obs_mats, self.cov_select_mats,
+                self.initial_distributions, self.reg_func, self.obs_distribution)
+            ts_means, ts = sts_ssm.posterior_sample(key, obs_time_series, inputs)
+            return [ts_means, ts]
+
+        samples = vmap(single_sample)(sts_params)
+
+        return {'means': samples[0], 'observations': samples[1]}
+
+    def decompose_by_component(self, sts_params, obs_time_series, covariates=None,
+                               num_pos_samples=100, key=jr.PRNGKey(0)):
         """Decompose the STS model into components and return the means and variances
            of the marginal posterior of each component.
 
@@ -155,99 +231,42 @@ class StructuralTimeSeries():
 
         # Sample parameters from the posterior if parameters is not given
         if sts_params is None:
-            sts_ssm = self.as_ssm()
-            sts_params = self.fit_hmc(key, num_post_samples, observed_time_series, inputs)
+            sts_params = self.fit_hmc(num_pos_samples, obs_time_series, covariates, key=key)
 
         @jit
         def single_decompose(sts_param):
-            sts_ssm = StructuralTimeSeriesSSM(
-                self.params, self.param_props, self.param_priors,
-                self.trans_mat_getters, self.trans_cov_getters, self.obs_mats, self.cov_select_mats,
-                self.initial_distributions, self.reg_func, self.obs_distribution)
-            return sts_ssm.component_posterior(observed_time_series, inputs)
+            sts_ssm = self.as_ssm()
+            return sts_ssm.component_posterior(sts_param, obs_time_series, covariates)
 
         component_conditional_pos = vmap(single_decompose)(sts_params)
 
         # Obtain the marginal posterior
         for c, pos in component_conditional_pos.items():
-            mus = pos[0]
-            vars = pos[1]
+            means = pos['pos_mean']
+            covs = pos['pos_cov']
             # Use the formula: E[X] = E[E[X|Y]]
-            mu_series = mus.mean(axis=0)
+            mean_series = means.mean(axis=0)
             # Use the formula: Var(X) = E[Var(X|Y)] + Var(E[X|Y])
-            var_series = jnp.mean(vars, axis=0)[..., 0] + jnp.var(mus, axis=0)
-            component_dists[c] = (mu_series, var_series)
+            cov_series = jnp.mean(covs, axis=0)[..., 0] + jnp.var(means, axis=0)
+            component_dists[c] = (mean_series, cov_series)
 
         return component_dists
 
-    def sample(self, key, num_timesteps, inputs=None):
-        """Given parameters, sample latent states and corresponding observed time series.
+    def forecast(self,
+                 sts_params,
+                 obs_time_series,
+                 num_forecast_steps,
+                 past_covariates=None,
+                 forecast_covariates=None,
+                 key=jr.PRNGKey(0)):
+        """Forecast.
         """
-        sts_ssm = self.as_ssm()
-        states, timeseries = sts_ssm.sample(key, num_timesteps, inputs)
-        return timeseries
-
-    def marginal_log_prob(self, obs_time_series, inputs=None):
-        sts_ssm = self.as_ssm()
-        return sts_ssm.marginal_log_prob(sts_ssm.params, obs_time_series, inputs)
-
-    def posterior_sample(self, key, obs_time_series, sts_params, inputs=None):
-        """Sample latent states given model parameters."""
-        @jit
-        def single_sample(sts_param):
-            sts_ssm = StructuralTimeSeriesSSM(
-                sts_param, self.param_props, self.param_priors,
-                self.trans_mat_getters, self.trans_cov_getters, self.obs_mats, self.cov_select_mats,
-                self.initial_distributions, self.reg_func, self.obs_distribution)
-            ts_means, ts = sts_ssm.posterior_sample(key, obs_time_series, inputs)
-            return [ts_means, ts]
-
-        samples = vmap(single_sample)(sts_params)
-
-        return {'means': samples[0], 'observations': samples[1]}
-
-    def fit_hmc(self, key, sample_size, observed_time_series, inputs=None,
-                warmup_steps=500, num_integration_steps=30):
-        """Sample parameters of the STS model from their posterior distributions.
-
-        Parameters of the STS model includes:
-            covariance matrix of each component,
-            regression coefficient matrix (if the model has inputs and a regression component)
-            covariance matrix of observations (if observations follow Gaussian distribution)
-        """
-        # Initialize via fit MLE
-        sts_ssm = self.fit_mle()
-        param_samps = sts_ssm.fit_hmc(key, sample_size, observed_time_series, inputs,
-                                      warmup_steps, num_integration_steps)
-        return param_samps
-
-    def fit_mle(self, obs_time_series, covariates=None, num_steps=1000,
-                initial_params=None, optimizer=optax.adam(1e-1), key=jr.PRNGKey(0)):
-        """Maximum likelihood estimate of parameters of the STS model
-        """
-        sts_ssm = self.as_ssm()
-        batch_obs = jnp.array([obs_time_series])
-        if covariates is not None:
-            covariates = jnp.array([covariates])
-        curr_params = sts_ssm.params if initial_params is None else initial_params
-        param_props = sts_ssm.param_props
-
-        optimal_params, losses = sts_ssm.fit_sgd(
-            curr_params, param_props, batch_obs, num_epochs=num_steps,
-            key=key, covariates=covariates, optimizer=optimizer)
-
-        return optimal_params, losses
-
-    def forecast(self, key, obs_time_series, sts_params, num_forecast_steps,
-                 past_inputs=None, forecast_inputs=None):
         @jit
         def single_forecast(sts_param):
-            sts_ssm = StructuralTimeSeriesSSM(
-                self.params, self.param_props, self.param_priors,
-                self.trans_mat_getters, self.trans_cov_getters, self.obs_mats, self.cov_select_mats,
-                self.initial_distributions, self.reg_func, self.obs_distribution)
+            sts_ssm = self.as_ssm()
             means, covs, ts = sts_ssm.forecast(
-                key, obs_time_series, num_forecast_steps, past_inputs, forecast_inputs)
+                sts_param, obs_time_series, num_forecast_steps,
+                past_covariates, forecast_covariates, key)
             return [means, covs, ts]
 
         forecasts = vmap(single_forecast)(sts_params)
