@@ -125,16 +125,16 @@ class StructuralTimeSeries():
                                           self.dim_covariate)
         return sts_ssm
 
-    def sample(self, key, num_timesteps, inputs=None):
+    def sample(self, key, num_timesteps, covariates=None):
         """Given parameters, sample latent states and corresponding observed time series.
         """
         sts_ssm = self.as_ssm()
-        states, timeseries = sts_ssm.sample(key, num_timesteps, inputs)
+        states, timeseries = sts_ssm.sample(key, num_timesteps, covariates)
         return timeseries
 
-    def marginal_log_prob(self, obs_time_series, inputs=None):
+    def marginal_log_prob(self, obs_time_series, covariates=None):
         sts_ssm = self.as_ssm()
-        return sts_ssm.marginal_log_prob(sts_ssm.params, obs_time_series, inputs)
+        return sts_ssm.marginal_log_prob(sts_ssm.params, obs_time_series, covariates)
 
     def fit_mle(self,
                 obs_time_series,
@@ -177,7 +177,7 @@ class StructuralTimeSeries():
         sts_ssm = self.as_ssm()
         # Initialize via fit MLE if initial params is not given.
         if initial_params is None:
-            initial_params, _losses = self.fit_mle(obs_time_series, covariates, num_steps=500)
+            initial_params, _losses = self.fit_mle(obs_time_series, covariates, num_steps=1000)
         if param_props is None:
             param_props = self.param_props
 

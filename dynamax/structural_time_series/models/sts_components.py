@@ -235,7 +235,7 @@ class Autoregressive(STSComponent):
         self.params['cov_level'] = self.param_priors['cov_level'].mode()
 
         self.param_props['coef'] = Prop(trainable=True, constrainer=tfb.Tanh())
-        self.param_priors['coef'] = MVNDiag(loc=.5+jnp.zeros(order), scale_diag=jnp.ones(order))
+        self.param_priors['coef'] = MVNDiag(jnp.zeros(order), jnp.ones(order))
         self.params['coef'] = self.param_priors['coef'].mode()
 
         # Fixed observation matrix.

@@ -245,7 +245,6 @@ class StructuralTimeSeriesSSM(SSM):
                 emissions,
                 covariates=None,
                 warmup_steps=100,
-                num_integration_steps=30,
                 verbose=True):
         """Sample parameters of the model using HMC.
         """
@@ -265,7 +264,6 @@ class StructuralTimeSeriesSSM(SSM):
             return lp
 
         # Initialize the HMC sampler using window_adaptations
-        hmc_initial_position, fixed_params = to_unconstrained(self.params, self.param_props)
         warmup = blackjax.window_adaptation(blackjax.nuts, unnorm_log_pos, num_steps=warmup_steps)
         init_key, key = jr.split(key)
         hmc_initial_state, hmc_kernel, _ = warmup.run(init_key, initial_unc_params)
