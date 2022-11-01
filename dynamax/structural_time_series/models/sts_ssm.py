@@ -55,7 +55,8 @@ class StructuralTimeSeriesSSM(SSM):
                  cov_select_mats,
                  initial_distributions,
                  reg_func=None,
-                 obs_distribution='Gaussian'):
+                 obs_distribution='Gaussian',
+                 dim_covariate=0):
         self.params = params
         self.param_props = param_props
         self.param_priors = param_priors
@@ -79,6 +80,7 @@ class StructuralTimeSeriesSSM(SSM):
         # Dimensions of the SSM.
         self.dim_obs, self.dim_state = self.obs_mat.shape
         self.dim_comp = self.get_trans_cov(self.params, 0).shape[0]
+        self.dim_covariate = dim_covariate
 
         # Pick out the regression component if there is one.
         if reg_func is not None:
@@ -89,6 +91,10 @@ class StructuralTimeSeriesSSM(SSM):
     @property
     def emission_shape(self):
         return (self.dim_obs,)
+
+    @property
+    def covariates_shape(self):
+        return (self.dim_covariate,)
 
     def log_prior(self, params):
         """Log prior probability of parameters.

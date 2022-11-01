@@ -132,7 +132,7 @@ class STSRegression(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def fitted_values(self, params, covariates):
+    def fit(self, params, covariates):
         """Compute the fitted value of the regression model at one time step
             given parameters and covariates.
 
@@ -224,38 +224,36 @@ class Autoregressive(STSComponent):
     Args (in addition to name and dim_obs):
         p (int): the autoregressive order
     """
-    def __init__(self, p, dim_obs=1, name='ar'):
+    def __init__(self, order, dim_obs=1, name='ar'):
         super().__init__(name=name, dim_obs=dim_obs)
 
-        self.order = p
-        self.initial_distribution = MVN(jnp.zeros(p*dim_obs), jnp.eye(p*dim_obs))
+        self.order = order
+        self.initial_distribution = MVN(jnp.zeros(order*dim_obs), jnp.eye(order*dim_obs))
 
         self.param_props['cov_level'] = Prop(trainable=True, constrainer=RealToPSD)
         self.param_priors['cov_level'] = IW(df=dim_obs, scale=jnp.eye(dim_obs))
         self.params['cov_level'] = self.param_priors['cov_level'].mode()
 
         self.param_props['coef'] = Prop(trainable=True, constrainer=tfb.Tanh())
-        self.param_priors['coef'] = MVNDiag(loc=jnp.zeros(p), scale_diag=jnp.ones(p))
-        self.params['coef'] = self.param_priors['coef'].mode
+        self.param_priors['coef'] = MVNDiag(loc=.5+jnp.zeros(order), scale_diag=jnp.ones(order))
+        self.params['coef'] = self.param_priors['coef'].mode()
 
         # Fixed observation matrix.
-        self._obs_mat = jnp.kron(jnp.eye(p)[0], jnp.eye(dim_obs))
+        self._obs_mat = jnp.kron(jnp.eye(order)[0], jnp.eye(dim_obs))
 
         # Covariance selection matrix.
-        self._cov_select_mat = jnp.kron(jnp.eye(p)[:, 0], jnp.eye(dim_obs))
+        self._cov_select_mat = jnp.kron(jnp.eye(order)[:, 0], jnp.eye(dim_obs))
 
     def initialize_params(self, obs_initial, obs_scale):
         # Initialize the distribution of the initial state.
         dim_obs = len(obs_initial)
-        initial_mean = jnp.concatenate((obs_initial, jnp.zeros(dim_obs)))
-        initial_cov = jnp.kron(jnp.eye(2), jnp.diag(obs_scale**2))
+        initial_mean = jnp.kron(jnp.eye(self.order)[0], obs_initial)
+        initial_cov = jnp.kron(jnp.eye(self.order), jnp.diag(obs_scale**2))
         self.initial_distribution = MVN(initial_mean, initial_cov)
 
         # Initialize parameters.
         self.param_priors['cov_level'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
         self.params['cov_level'] = self.param_priors['cov_level'].mode()
-        self.param_priors['coef'] = IW(df=dim_obs, scale=1e-3*obs_scale**2*jnp.eye(dim_obs))
-        self.params['coef'] = self.param_priors['cov_slope'].mode()
 
     def get_trans_mat(self, params, t):
         if self.order == 1:
@@ -350,7 +348,7 @@ class SeasonalDummy(STSComponent):
     def get_trans_cov(self, params, t):
         return lax.cond(t % self.steps_per_season == 0,
                         lambda: params['drift_cov'],
-                        lambda: jnp.zeros((self.dim_obs, self.dim_obs)))
+                        lambda: jnp.eye(self.dim_obs)*1e-32)
 
     @property
     def obs_mat(self):
@@ -448,8 +446,8 @@ class SeasonalTrig(STSComponent):
 
     def get_trans_cov(self, params, t):
         return lax.cond(t % self.steps_per_season == 0,
-                        lambda: params['drift_cov'],
-                        lambda: jnp.zeros((self.dim_obs, self.dim_obs)))
+                        lambda: jnp.kron(jnp.eye(self.num_seasons-1), params['drift_cov']),
+                        lambda: jnp.eye((self.num_seasons-1)*self.dim_obs)*1e-32)
 
     @property
     def obs_mat(self):
@@ -556,7 +554,7 @@ class LinearRegression(STSRegression):
     where X = covariates if add_bias=False and X = [covariates, 1] if add_bias=True.
     """
     def __init__(self, dim_covariates, add_bias=True, dim_obs=1, name='linear_regression'):
-
+        super().__init__(name=name, dim_obs=dim_obs)
         self.add_bias = add_bias
 
         dim_inputs = dim_covariates + 1 if add_bias else dim_covariates
@@ -569,12 +567,13 @@ class LinearRegression(STSRegression):
 
     def initialize(self, covariates, obs_time_series):
         if self.add_bias:
-            inputs = jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)), axis=0)
-        W = jnp.solve(inputs.T @ inputs, inputs.T @ obs_time_series)
+            inputs = jnp.concatenate((covariates, jnp.ones((covariates.shape[0], 1))), axis=1)
+        W = jnp.linalg.solve(inputs.T @ inputs, inputs.T @ obs_time_series)
         self.params['weights'] = W
 
     def fit(self, params, covariates):
         if self.add_bias:
-            return params['weights'] @ jnp.concatenate((covariates, jnp.ones(covariates.shape[0], 1)))
+            inputs = jnp.concatenate((covariates, jnp.ones((covariates.shape[0], 1))), axis=1)
+            return inputs @ params['weights']
         else:
-            return params['weights'] @ covariates
+            return covariates @ params['weights']

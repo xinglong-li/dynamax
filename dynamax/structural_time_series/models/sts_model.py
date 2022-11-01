@@ -4,7 +4,7 @@ import jax.random as jr
 from jax import vmap, jit
 from dynamax.distributions import InverseWishart as IW
 from dynamax.parameters import ParameterProperties as Prop
-from dynamax.structural_time_series.models.sts_ssm1 import StructuralTimeSeriesSSM
+from dynamax.structural_time_series.models.sts_ssm import StructuralTimeSeriesSSM
 from dynamax.structural_time_series.models.sts_components import *
 from dynamax.utils import PSDToRealBijector
 import optax
@@ -53,6 +53,7 @@ class StructuralTimeSeries():
         self.name = name
         self.dim_obs = obs_time_series.shape[-1]
         self.obs_distribution = obs_distribution
+        self.dim_covariate = covariates.shape[-1] if covariates is not None else 0
 
         # Initialize paramters using the scale of observed time series
         regression = None
@@ -120,7 +121,8 @@ class StructuralTimeSeries():
                                           self.cov_select_mats,
                                           self.initial_distributions,
                                           self.reg_func,
-                                          self.obs_distribution)
+                                          self.obs_distribution,
+                                          self.dim_covariate)
         return sts_ssm
 
     def sample(self, key, num_timesteps, inputs=None):
@@ -144,14 +146,14 @@ class StructuralTimeSeries():
         """Maximum likelihood estimate of parameters of the STS model
         """
         sts_ssm = self.as_ssm()
-        batch_obs = jnp.array([obs_time_series])
-        if covariates is not None:
-            covariates = jnp.array([covariates])
+        # batch_obs = jnp.array([obs_time_series])
+        # if covariates is not None:
+        #     covariates = jnp.array([covariates])
         curr_params = sts_ssm.params if initial_params is None else initial_params
         param_props = sts_ssm.param_props
 
         optimal_params, losses = sts_ssm.fit_sgd(
-            curr_params, param_props, batch_obs, num_epochs=num_steps,
+            curr_params, param_props, obs_time_series, num_epochs=num_steps,
             key=key, covariates=covariates, optimizer=optimizer)
 
         return optimal_params, losses
@@ -175,14 +177,14 @@ class StructuralTimeSeries():
         sts_ssm = self.as_ssm()
         # Initialize via fit MLE if initial params is not given.
         if initial_params is None:
-            initial_params = self.fit_mle(obs_time_series, covariates, num_steps=500)
+            initial_params, _losses = self.fit_mle(obs_time_series, covariates, num_steps=500)
         if param_props is None:
             param_props = self.param_props
 
-        param_samps = sts_ssm.fit_hmcfit_hmc(
+        param_samps, param_log_probs = sts_ssm.fit_hmc(
             initial_params, param_props, key, num_samples, obs_time_series, covariates,
             warmup_steps, verbose)
-        return param_samps
+        return param_samps, param_log_probs
 
     def posterior_sample(self, key, obs_time_series, sts_params, inputs=None):
         """Sample latent states given model parameters."""
@@ -248,7 +250,8 @@ class StructuralTimeSeries():
             mean_series = means.mean(axis=0)
             # Use the formula: Var(X) = E[Var(X|Y)] + Var(E[X|Y])
             cov_series = jnp.mean(covs, axis=0)[..., 0] + jnp.var(means, axis=0)
-            component_dists[c] = (mean_series, cov_series)
+            component_dists[c] = {'pos_mean': mean_series,
+                                  'pos_cov': cov_series}
 
         return component_dists
 
