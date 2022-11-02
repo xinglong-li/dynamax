@@ -204,10 +204,13 @@ class StructuralTimeSeriesSSM(SSM):
     def component_posterior(self, params, obs_time_series, covariates=None):
         """Smoothing by component.
         """
+        component_pos = OrderedDict()
         if covariates is not None:
             # If there is a regression component, set the inputs of the emission model
             # of the SSM as the fitted value of the regression component.
             inputs = self.regression(params[self.reg_name], covariates)
+            component_pos[self.reg_name] = {'pos_mean': jnp.squeeze(inputs),
+                                            'pos_cov': jnp.zeros_like(obs_time_series)}
         else:
             inputs = jnp.zeros(obs_time_series.shape)
 
@@ -219,8 +222,7 @@ class StructuralTimeSeriesSSM(SSM):
         mu_pos = pos.smoothed_means
         var_pos = pos.smoothed_covariances
 
-        # Decompose by component
-        component_pos = OrderedDict()
+        # Decompose by latent component.
         _loc = 0
         for c, obs_mat in self.component_obs_mats.items():
             # Extract posterior mean and covariances of each component
@@ -352,6 +354,12 @@ class StructuralTimeSeriesSSM(SSM):
         _, (ts_means, ts_mean_covs, ts) = lax.scan(_step, initial_states, carrys)
 
         return ts_means, ts_mean_covs, ts
+
+    def one_step_predict(self, params, obs_time_series, covariates=None):
+        """One step forward prediction.
+           This is a by product of the Kalman filter.
+        """
+        raise NotImplementedError
 
     def get_trans_mat(self, params, t):
         """Evaluate the transition matrix of the latent state at time step t,

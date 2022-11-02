@@ -166,7 +166,9 @@ class LocalLinearTrend(STSComponent):
                     | 0, 1 |,
     """
 
-    def __init__(self, dim_obs=1, name='local_linear_trend'):
+    def __init__(self,
+                 dim_obs=1,
+                 name='local_linear_trend'):
         super().__init__(name=name, dim_obs=dim_obs)
 
         self.initial_distribution = MVN(jnp.zeros(2*dim_obs), jnp.eye(2*dim_obs))
@@ -224,7 +226,10 @@ class Autoregressive(STSComponent):
     Args (in addition to name and dim_obs):
         p (int): the autoregressive order
     """
-    def __init__(self, order, dim_obs=1, name='ar'):
+    def __init__(self,
+                 order,
+                 dim_obs=1,
+                 name='ar'):
         super().__init__(name=name, dim_obs=dim_obs)
 
         self.order = order
@@ -306,7 +311,11 @@ class SeasonalDummy(STSComponent):
             then num_steps_per_season = 24.
     """
 
-    def __init__(self, num_seasons, num_steps_per_season=1, dim_obs=1, name='seasonal_dummy'):
+    def __init__(self,
+                 num_seasons,
+                 num_steps_per_season=1,
+                 dim_obs=1,
+                 name='seasonal_dummy'):
         super().__init__(name=name, dim_obs=dim_obs)
 
         self.num_seasons = num_seasons
@@ -394,7 +403,11 @@ class SeasonalTrig(STSComponent):
             then num_steps_per_season = 24.
     """
 
-    def __init__(self, num_seasons, num_steps_per_season=1, dim_obs=1, name='seasonal_trig'):
+    def __init__(self,
+                 num_seasons,
+                 num_steps_per_season=1,
+                 dim_obs=1,
+                 name='seasonal_trig'):
         super().__init__(name=name, dim_obs=dim_obs)
 
         self.num_seasons = num_seasons
@@ -485,7 +498,9 @@ class Cycle(STSComponent):
         therefore the period of cycle is 2\pi/freq.
     """
 
-    def __init__(self, dim_obs=1, name='cycle'):
+    def __init__(self,
+                 dim_obs=1,
+                 name='cycle'):
         super().__init__(name=name, dim_obs=dim_obs)
 
         self.initial_distribution = MVN(jnp.zeros(2*dim_obs), jnp.eye(2*dim_obs))
@@ -553,7 +568,11 @@ class LinearRegression(STSRegression):
 
     where X = covariates if add_bias=False and X = [covariates, 1] if add_bias=True.
     """
-    def __init__(self, dim_covariates, add_bias=True, dim_obs=1, name='linear_regression'):
+    def __init__(self,
+                 dim_covariates,
+                 add_bias=True,
+                 dim_obs=1,
+                 name='linear_regression'):
         super().__init__(name=name, dim_obs=dim_obs)
         self.add_bias = add_bias
 
