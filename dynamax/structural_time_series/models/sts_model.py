@@ -93,7 +93,7 @@ class StructuralTimeSeries():
             if obs_cov_props is None:
                 obs_cov_props = Prop(trainable=True, constrainer=RealToPSD)
             if obs_cov_prior is None:
-                obs_cov_prior = IW(df=self.dim_obs, scale=1e-3*obs_scale**2*jnp.eye(self.dim_obs))
+                obs_cov_prior = IW(df=self.dim_obs, scale=1e-4*obs_scale**2*jnp.eye(self.dim_obs))
             if obs_cov is None:
                 obs_cov = obs_cov_prior.mode()
             self.param_props['obs_model'] = OrderedDict({'cov': obs_cov_props})

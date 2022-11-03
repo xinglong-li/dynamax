@@ -167,6 +167,10 @@ class LocalLinearTrend(STSComponent):
     """
 
     def __init__(self,
+                 level_cov_prior=None,
+                 slope_cov_prior=None,
+                 initial_level_prior=None,
+                 initial_slope_prior=None,
                  dim_obs=1,
                  name='local_linear_trend'):
         super().__init__(name=name, dim_obs=dim_obs)
@@ -228,6 +232,10 @@ class Autoregressive(STSComponent):
     """
     def __init__(self,
                  order,
+                 coefficients_prior=None,
+                 level_cov_prior=None,
+                 initial_state_prior=None,
+                 coefficient_constraining_bijector=None,
                  dim_obs=1,
                  name='ar'):
         super().__init__(name=name, dim_obs=dim_obs)
@@ -314,6 +322,9 @@ class SeasonalDummy(STSComponent):
     def __init__(self,
                  num_seasons,
                  num_steps_per_season=1,
+                 allow_drift=True,
+                 drift_cov_prior=None,
+                 initial_effect_prior=None,
                  dim_obs=1,
                  name='seasonal_dummy'):
         super().__init__(name=name, dim_obs=dim_obs)
@@ -406,6 +417,9 @@ class SeasonalTrig(STSComponent):
     def __init__(self,
                  num_seasons,
                  num_steps_per_season=1,
+                 allow_drift=True,
+                 drift_cov_prior=None,
+                 initial_state_prior=None,
                  dim_obs=1,
                  name='seasonal_trig'):
         super().__init__(name=name, dim_obs=dim_obs)
@@ -499,6 +513,10 @@ class Cycle(STSComponent):
     """
 
     def __init__(self,
+                 damping_factor_prior=None,
+                 frequency_prior=None,
+                 drift_cov_prior=None,
+                 initial_effect_prior=None,
                  dim_obs=1,
                  name='cycle'):
         super().__init__(name=name, dim_obs=dim_obs)
@@ -571,6 +589,7 @@ class LinearRegression(STSRegression):
     def __init__(self,
                  dim_covariates,
                  add_bias=True,
+                 weights_prior=None,
                  dim_obs=1,
                  name='linear_regression'):
         super().__init__(name=name, dim_obs=dim_obs)

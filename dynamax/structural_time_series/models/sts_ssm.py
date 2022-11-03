@@ -26,7 +26,6 @@ from dynamax.utils import (
 from tensorflow_probability.substrates.jax.distributions import (
     MultivariateNormalFullCovariance as MVN,
     Poisson as Pois)
-from tqdm.auto import trange
 
 
 class StructuralTimeSeriesSSM(SSM):
