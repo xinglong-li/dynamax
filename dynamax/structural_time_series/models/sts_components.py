@@ -367,7 +367,7 @@ class SeasonalDummy(STSComponent):
 
     def get_trans_cov(self, params, t):
         return lax.cond(t % self.steps_per_season == 0,
-                        lambda: params['drift_cov'],
+                        lambda: jnp.atleast_2d(params['drift_cov']),
                         lambda: jnp.eye(self.dim_obs)*1e-32)
 
     @property

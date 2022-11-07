@@ -2,6 +2,7 @@ from collections import OrderedDict
 import jax.numpy as jnp
 import jax.random as jr
 from jax import vmap, jit
+from jax.tree_util import tree_map, tree_flatten
 from dynamax.distributions import InverseWishart as IW
 from dynamax.parameters import ParameterProperties as Prop
 from dynamax.structural_time_series.models.sts_ssm import StructuralTimeSeriesSSM
@@ -188,6 +189,8 @@ class StructuralTimeSeries():
 
     def posterior_sample(self, key, obs_time_series, sts_params, inputs=None):
         """Sample latent states given model parameters."""
+        sts_params = self._ensure_param_has_batch_dim(sts_params)
+
         @jit
         def single_sample(sts_param):
             sts_ssm = StructuralTimeSeriesSSM(
@@ -229,6 +232,8 @@ class StructuralTimeSeries():
             component_dists: (OrderedDict) each item is a tuple of means and variances
                               of one component.
         """
+        sts_params = self._ensure_param_has_batch_dim(sts_params)
+
         component_dists = OrderedDict()
 
         # Sample parameters from the posterior if parameters is not given
@@ -264,6 +269,8 @@ class StructuralTimeSeries():
                  key=jr.PRNGKey(0)):
         """Forecast.
         """
+        sts_params = self._ensure_param_has_batch_dim(sts_params)
+
         @jit
         def single_forecast(sts_param):
             sts_ssm = self.as_ssm()
@@ -275,3 +282,16 @@ class StructuralTimeSeries():
         forecasts = vmap(single_forecast)(sts_params)
 
         return {'means': forecasts[0], 'covariances': forecasts[1], 'observations': forecasts[2]}
+
+    def _ensure_param_has_batch_dim(self, sts_params):
+        """Turn parameters into batch if only one parameter is given"""
+        # All latent components except for 'LinearRegression' have transition covariances
+        # and the linear regression has coefficient matrix.
+        # When the observation is Gaussian, the observation model also has a covariance matrix.
+        # So here we assume that the largest dimension of parameters is 2.
+        param_list, _ = tree_flatten(sts_params)
+        max_params_dim = max([len(x.shape) for x in param_list])
+        if max_params_dim > 2:
+            return sts_params
+        else:
+            return tree_map(lambda x: jnp.expand_dims(x, 0), sts_params)

@@ -319,22 +319,22 @@ class StructuralTimeSeriesSSM(SSM):
         filtered_mean = filtered_posterior.filtered_means
         filtered_cov = filtered_posterior.filtered_covariances
 
-        def _step(prev_states, args):
+        def _step(current_states, args):
             key, forecast_input, t = args
             key1, key2 = jr.split(key)
-            prev_mean, prev_cov, prev_state = prev_states
+            cur_mean, cur_cov, cur_state = current_states
 
             # Observation of the previous time step.
-            obs_mean_unc = self.obs_mat @ prev_mean + forecast_input
+            obs_mean_unc = self.obs_mat @ cur_mean + forecast_input
             obs_mean = self._emission_constrainer(obs_mean_unc)
-            obs_cov = self.obs_mat @ prev_cov @ self.obs_mat.T
-            obs = self.emission_distribution(prev_state, forecast_input).sample(seed=key2)
+            obs_cov = self.obs_mat @ cur_cov @ self.obs_mat.T + params['obs_model']['cov']
+            obs = self.emission_distribution(cur_state, forecast_input).sample(seed=key2)
 
             # Predict the latent state of the next time step.
-            next_mean = get_trans_mat(t) @ prev_mean
-            next_cov = get_trans_mat(t) @ prev_cov @ get_trans_mat(t).T\
+            next_mean = get_trans_mat(t) @ cur_mean
+            next_cov = get_trans_mat(t) @ cur_cov @ get_trans_mat(t).T\
                 + self.cov_select_mat @ get_trans_cov(t) @ self.cov_select_mat.T
-            next_state = get_trans_mat(t) @ prev_state\
+            next_state = get_trans_mat(t) @ cur_state\
                 + self.cov_select_mat @ MVN(jnp.zeros(self.dim_comp), get_trans_cov(t)).sample(seed=key1)
             return (next_mean, next_cov, next_state), (obs_mean, obs_cov, obs)
 
@@ -349,7 +349,7 @@ class StructuralTimeSeriesSSM(SSM):
         # Forecast the following up steps.
         carrys = (jr.split(key, num_forecast_steps),
                   forecast_inputs,
-                  t0+jnp.arange(num_forecast_steps))
+                  t0 + 1 + jnp.arange(num_forecast_steps))
         _, (ts_means, ts_mean_covs, ts) = lax.scan(_step, initial_states, carrys)
 
         return ts_means, ts_mean_covs, ts
