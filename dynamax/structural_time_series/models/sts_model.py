@@ -238,6 +238,7 @@ class StructuralTimeSeries():
                               of one component.
         """
         sts_params = self._ensure_param_has_batch_dim(sts_params)
+        obs_time_series = obs_time_series - self.offset
 
         component_dists = OrderedDict()
 

@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import jax.scipy as jsp
 from jaxopt import LBFGS
+from jax.tree_util import tree_map
 from dynamax.abstractions import SSM
 from dynamax.generalized_gaussian_ssm.conditional_moments_gaussian_filter import (
     iterated_conditional_moments_gaussian_filter as cmgf_filt,
@@ -28,6 +29,7 @@ from dynamax.utils import (
     ensure_array_has_batch_dim)
 from tensorflow_probability.substrates.jax.distributions import (
     MultivariateNormalFullCovariance as MVN,
+    MultivariateNormalDiag as MVNDiag,
     Poisson as Pois)
 
 
@@ -274,23 +276,27 @@ class StructuralTimeSeriesSSM(SSM):
         Returns:
             Samples from the approximate posterior q
         """
-        key0, key1 = jr.split(key)
-        model_unc_params, fixed_params = to_unconstrained(self.params, self.param_props)
-        params_flat, params_structure = flatten(model_unc_params)
+        # Make sure the emissions and covariates have batch dimensions
+        batch_emissions = ensure_array_has_batch_dim(emissions, self.emission_shape)
+        batch_covariates = ensure_array_has_batch_dim(covariates, self.covariates_shape)
+
+        initial_unc_params, fixed_params = to_unconstrained(initial_params, param_props)
+
+        params_flat, params_structure = flatten(initial_unc_params)
         vi_dim = len(params_flat)
 
+        # Fixed samples from q.
+        key0, key1 = jr.split(key, 2)
         std_normal = MVNDiag(jnp.zeros(vi_dim), jnp.ones(vi_dim))
         std_samples = std_normal.sample(seed=key0, sample_shape=(M,))
         std_samples = vmap(unflatten, (None, 0))(params_structure, std_samples)
 
         @jit
-        def unnorm_log_pos(unc_params):
-            """Unnormalzied log posterior of global parameters."""
-
-            params = from_unconstrained(unc_params, fixed_params, self.param_props)
-            log_det_jac = log_det_jac_constrain(unc_params, fixed_params, self.param_props)
+        def unnorm_log_pos(_unc_params):
+            params = from_unconstrained(_unc_params, fixed_params, param_props)
+            log_det_jac = log_det_jac_constrain(_unc_params, fixed_params, param_props)
             log_pri = self.log_prior(params) + log_det_jac
-            batch_lls = self.marginal_log_prob(params, emissions, inputs)
+            batch_lls = vmap(partial(self.marginal_log_prob, params))(batch_emissions, batch_covariates)
             lp = log_pri + batch_lls.sum()
             return lp
 
@@ -298,29 +304,24 @@ class StructuralTimeSeriesSSM(SSM):
         def _samp_elbo(vi_params, std_samp):
             """Evaluate ELBO at one sample from the approximate distribution q.
             """
-            vi_means, vi_log_sigmas = vi_params
-            # unc_params_flat = vi_means + std_samp * jnp.exp(vi_log_sigmas)
-            # unc_params = unflatten(params_structure, unc_params_flat)
-            # With reparameterization, entropy of q evaluated at z is
-            # sum(hyper_log_sigma) plus some constant depending only on z.
-            _params = tree_map(lambda x, log_sig: x * jnp.exp(log_sig), std_samp, vi_log_sigmas)
-            unc_params = tree_map(lambda x, mu: x + mu, _params, vi_means)
-            q_entropy = flatten(vi_log_sigmas)[0].sum()
+            unc_params = tree_map(lambda x, y: y[0] + x*jnp.exp(y[1]),
+                                  std_samp, vi_params)
+            q_entropy = flatten(vi_params)[0].sum()
             return q_entropy + unnorm_log_pos(unc_params)
 
         objective = lambda x: -vmap(_samp_elbo, (None, 0))(x, std_samples).mean()
 
         # Fit ADVI with LBFGS algorithm
-        initial_vi_means = model_unc_params
+        initial_vi_means = initial_unc_params
         initial_vi_log_sigmas = unflatten(params_structure, jnp.zeros(vi_dim))
-        initial_vi_params = (initial_vi_means, initial_vi_log_sigmas)
+        initial_vi_params = vmap(lambda x, y: (x, y), initial_vi_means, initial_vi_log_sigmas)
         lbfgs = LBFGS(fun=objective)
-        (vi_means, vi_log_sigmas), _info = lbfgs.run(initial_vi_params)
+        vi_params, _info = lbfgs.run(initial_vi_params)
 
         # Sample from the learned approximate posterior q
         _samples = std_normal.sample(seed=key1, sample_shape=(sample_size,))
-        _vi_means = flatten(vi_means)[0]
-        _vi_log_sigmas = flatten(vi_log_sigmas)[0]
+        _vi_means = flatten(vi_params)[0]
+        _vi_log_sigmas = flatten(vi_params)[0]
         vi_samples_flat = _vi_means + _samples * jnp.exp(_vi_log_sigmas)
         vi_unc_samples = vmap(unflatten, (None, 0))(params_structure, vi_samples_flat)
         vi_samples = vmap(from_unconstrained, (0, None, None))(
