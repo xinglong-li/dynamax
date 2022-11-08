@@ -44,6 +44,7 @@ class StructuralTimeSeries():
                  obs_cov_prior=None,
                  obs_cov=None,
                  covariates=None,
+                 constant_offset=True,
                  name='sts_model'):
 
         names = [c.name for c in components]
@@ -55,6 +56,9 @@ class StructuralTimeSeries():
         self.dim_obs = obs_time_series.shape[-1]
         self.obs_distribution = obs_distribution
         self.dim_covariate = covariates.shape[-1] if covariates is not None else 0
+
+        self.offset = obs_time_series.mean(axis=0) if constant_offset else 0.
+        obs_time_series = obs_time_series - self.offset
 
         # Initialize paramters using the scale of observed time series
         regression = None
@@ -131,9 +135,10 @@ class StructuralTimeSeries():
         """
         sts_ssm = self.as_ssm()
         states, timeseries = sts_ssm.sample(key, num_timesteps, covariates)
-        return timeseries
+        return self.offset + timeseries
 
     def marginal_log_prob(self, obs_time_series, covariates=None):
+        obs_time_series = obs_time_series - self.offset
         sts_ssm = self.as_ssm()
         return sts_ssm.marginal_log_prob(sts_ssm.params, obs_time_series, covariates)
 
@@ -146,16 +151,14 @@ class StructuralTimeSeries():
                 key=jr.PRNGKey(0)):
         """Maximum likelihood estimate of parameters of the STS model
         """
+        obs_time_series = obs_time_series - self.offset
         sts_ssm = self.as_ssm()
-        # batch_obs = jnp.array([obs_time_series])
-        # if covariates is not None:
-        #     covariates = jnp.array([covariates])
         curr_params = sts_ssm.params if initial_params is None else initial_params
         param_props = sts_ssm.param_props
 
         optimal_params, losses = sts_ssm.fit_sgd(
             curr_params, param_props, obs_time_series, num_epochs=num_steps,
-            key=key, covariates=covariates, optimizer=optimizer)
+            key=key, inputs=covariates, optimizer=optimizer)
 
         return optimal_params, losses
 
@@ -175,6 +178,7 @@ class StructuralTimeSeries():
             regression coefficient matrix (if the model has inputs and a regression component)
             covariance matrix of observations (if observations follow Gaussian distribution)
         """
+        obs_time_series = obs_time_series - self.offset
         sts_ssm = self.as_ssm()
         # Initialize via fit MLE if initial params is not given.
         if initial_params is None:
@@ -190,6 +194,7 @@ class StructuralTimeSeries():
     def posterior_sample(self, key, obs_time_series, sts_params, inputs=None):
         """Sample latent states given model parameters."""
         sts_params = self._ensure_param_has_batch_dim(sts_params)
+        obs_time_series = obs_time_series - self.offset
 
         @jit
         def single_sample(sts_param):
@@ -198,7 +203,7 @@ class StructuralTimeSeries():
                 self.trans_mat_getters, self.trans_cov_getters, self.obs_mats, self.cov_select_mats,
                 self.initial_distributions, self.reg_func, self.obs_distribution)
             ts_means, ts = sts_ssm.posterior_sample(key, obs_time_series, inputs)
-            return [ts_means, ts]
+            return [self.offset + ts_means, self.offset + ts]
 
         samples = vmap(single_sample)(sts_params)
 
@@ -270,6 +275,7 @@ class StructuralTimeSeries():
         """Forecast.
         """
         sts_params = self._ensure_param_has_batch_dim(sts_params)
+        obs_time_series = obs_time_series - self.offset
 
         @jit
         def single_forecast(sts_param):
@@ -277,7 +283,7 @@ class StructuralTimeSeries():
             means, covs, ts = sts_ssm.forecast(
                 sts_param, obs_time_series, num_forecast_steps,
                 past_covariates, forecast_covariates, key)
-            return [means, covs, ts]
+            return [means + self.offset, covs, ts + self.offset]
 
         forecasts = vmap(single_forecast)(sts_params)
 

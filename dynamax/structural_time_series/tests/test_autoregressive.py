@@ -3,7 +3,7 @@ import jax.random as jr
 from jax import lax
 
 from dynamax.structural_time_series.models.sts_model import StructuralTimeSeries as STS
-from dynamax.structural_time_series.models.sts_components import LocalLinearTrend
+from dynamax.structural_time_series.models.sts_components import Autoregressive
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -18,37 +18,34 @@ def _build_models(time_steps, key):
     standard_mvn = MVN(jnp.zeros(1), jnp.eye(1))
 
     # Generate parameters of the STS component
-    level_scale = 5
-    slope_scale = 0.5
+    level_scale = 5.
+    coef = 0.8
     initial_level = standard_mvn.sample(seed=keys[0])
-    initial_slope = standard_mvn.sample(seed=keys[1])
 
-    obs_noise_scale = 10
+    obs_noise_scale = 4.
 
     # Generate observed time series using the SSM representation.
-    F = jnp.array([[1, 1],
-                   [0, 1]])
-    H = jnp.array([[1, 0]])
-    Q = jnp.block([[level_scale, 0],
-                   [0, slope_scale]])
+    F = jnp.array([[coef]])
+    H = jnp.array([[1]])
+    Q = jnp.array([[level_scale]])
     R = obs_noise_scale
 
     def _step(current_state, key):
         key1, key2 = jr.split(key)
         current_obs = H @ current_state + R * standard_mvn.sample(seed=key1)
-        next_state = F @ current_state + Q @ MVN(jnp.zeros(2), jnp.eye(2)).sample(seed=key2)
+        next_state = F @ current_state + Q @ MVN(jnp.zeros(1), jnp.eye(1)).sample(seed=key2)
         return next_state, current_obs
 
-    initial_state = jnp.concatenate((initial_level, initial_slope))
+    initial_state = initial_level
     key_seq = jr.split(keys[2], time_steps)
     _, obs_time_series = lax.scan(_step, initial_state, key_seq)
 
     # Build the STS model using tfp module.
-    tfp_comp = tfp.sts.LocalLinearTrend(observed_time_series=obs_time_series, name='local_linear_trend')
+    tfp_comp = tfp.sts.Autoregressive(order=1, observed_time_series=obs_time_series, name='ar')
     tfp_model = tfp.sts.Sum([tfp_comp], observed_time_series=obs_time_series)
 
     # Build the dynamax STS model.
-    dynamax_comp = LocalLinearTrend(name='local_linear_trend')
+    dynamax_comp = Autoregressive(order=1, name='ar')
     dynamax_model = STS([dynamax_comp], obs_time_series=obs_time_series)
 
     # Set the parameters to the parameters learned by the tfp module and fix the parameters.
@@ -62,10 +59,9 @@ def _build_models(time_steps, key):
     vi_dists, _ = tfp_vi_posterior.distribution.sample_distributions()
     tfp_params = tfp_vi_posterior.sample(sample_shape=(1,))
 
-    dynamax_model.params['local_linear_trend']['cov_level'] =\
-        jnp.atleast_2d(jnp.array(tfp_params['local_linear_trend/_level_scale']**2))
-    dynamax_model.params['local_linear_trend']['cov_slope'] =\
-        jnp.atleast_2d(jnp.array(tfp_params['local_linear_trend/_slope_scale']**2))
+    dynamax_model.params['ar']['cov_level'] =\
+        jnp.atleast_2d(jnp.array(tfp_params['ar/_level_scale']**2))
+    dynamax_model.params['ar']['coef'] = jnp.array(tfp_params['ar/_coefficients'])[0]
     dynamax_model.params['obs_model']['cov'] =\
         jnp.atleast_2d(jnp.array(tfp_params['observation_noise_scale']**2))
 
@@ -116,33 +112,3 @@ def test_local_linear_trend_forecast(time_steps=150, key=jr.PRNGKey(3)):
     # Compoare forecast by tfp and dynamax.
     assert jnp.allclose(tfp_forecast_mean, dynamax_forecast_mean, atol=0.5*len_step)
     assert jnp.allclose(tfp_forecast_scale, jnp.sqrt(dynamax_forecast_cov), rtol=5e-2)
-
-
-# def test_local_linear_trend_hmc(time_steps=150, key=jr.PRNGKey(3)):
-
-#     tfp_model, tfp_params, dynamax_model, dynamax_params, obs_time_series, vi_dists =\
-#         _build_models(time_steps, key)
-
-#     # Run hmc in tfp module
-#     tfp_initial_state = [tfp_params[p.name] for p in tfp_model.parameters]
-#     # Set step sizes using the unconstrained variational distribution.
-#     tfp_initial_step_size = [vi_dists[p.name].stddev() for p in tfp_model.parameters]
-#     tfp_samples, _ = tfp.sts.fit_with_hmc(tfp_model, obs_time_series, num_results=100,
-#                                           num_warmup_steps=50,
-#                                           initial_state=tfp_initial_state,
-#                                           initial_step_size=tfp_initial_step_size)
-#     tfp_scale_level = jnp.array(tfp_samples[1]).mean()
-#     tfp_scale_slope = jnp.array(tfp_samples[2]).mean()
-#     tfp_scale_obs = jnp.array(tfp_samples[0]).mean()
-
-#     # Run hmc in dynamax
-#     dynamax_samples, _ = dynamax_model.fit_hmc(100, obs_time_series,
-#                                                warmup_steps=50,
-#                                                initial_params=dynamax_params)
-#     dynamax_cov_level = dynamax_samples['local_linear_trend']['cov_level'].mean()
-#     dynamax_cov_slope = dynamax_samples['local_linear_trend']['cov_slope'].mean()
-#     dynamax_cov_obs = dynamax_samples['obs_model']['cov'].mean()
-
-#     assert jnp.allclose(tfp_scale_level, jnp.sqrt(dynamax_cov_level), rtol=1e-2)
-#     assert jnp.allclose(tfp_scale_slope, jnp.sqrt(dynamax_cov_slope), rtol=1e-2)
-#     assert jnp.allclose(tfp_scale_obs, jnp.sqrt(dynamax_cov_obs), rtol=1e-2)

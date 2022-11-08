@@ -7,13 +7,13 @@ import jax.random as jr
 import jax.scipy as jsp
 from jaxopt import LBFGS
 from dynamax.abstractions import SSM
-from dynamax.cond_moments_gaussian_filter.cmgf import (
+from dynamax.generalized_gaussian_ssm.conditional_moments_gaussian_filter import (
     iterated_conditional_moments_gaussian_filter as cmgf_filt,
     iterated_conditional_moments_gaussian_smoother as cmgf_smooth,
     EKFIntegrals)
-from dynamax.cond_moments_gaussian_filter.generalized_gaussian_ssm import GGSSMParams
+from dynamax.generalized_gaussian_ssm.generalized_gaussian_ssm import ParamsGGSSM
 from dynamax.linear_gaussian_ssm.inference import (
-    LGSSMParams,
+    ParamsLGSSMMoment,
     lgssm_filter,
     lgssm_smoother,
     lgssm_posterior_sample)
@@ -347,8 +347,8 @@ class StructuralTimeSeriesSSM(SSM):
 
         # The log likelihood that the HMC samples from
         def unnorm_log_pos(_unc_params):
-            params = from_unconstrained(_unc_params, fixed_params, self.param_props)
-            log_det_jac = log_det_jac_constrain(_unc_params, fixed_params, self.param_props)
+            params = from_unconstrained(_unc_params, fixed_params, param_props)
+            log_det_jac = log_det_jac_constrain(_unc_params, fixed_params, param_props)
             log_pri = self.log_prior(params) + log_det_jac
             batch_lls = vmap(partial(self.marginal_log_prob, params))(batch_emissions, batch_covariates)
             lp = log_pri + batch_lls.sum()
@@ -481,21 +481,21 @@ class StructuralTimeSeriesSSM(SSM):
         get_sparse_cov = lambda t:\
             self.cov_select_mat @ self.get_trans_cov(params, t) @ self.cov_select_mat.T
         if self.obs_distribution == 'Gaussian':
-            return LGSSMParams(initial_mean=self.initial_mean,
-                               initial_covariance=self.initial_cov,
-                               dynamics_matrix=get_trans_mat,
-                               dynamics_input_weights=jnp.zeros((self.dim_state, 1)),
-                               dynamics_bias=jnp.zeros(self.dim_state),
-                               dynamics_covariance=get_sparse_cov,
-                               emission_matrix=self.obs_mat,
-                               emission_input_weights=jnp.eye(self.dim_obs),
-                               emission_bias=jnp.zeros(self.dim_obs),
-                               emission_covariance=params['obs_model']['cov'])
+            return ParamsLGSSMMoment(initial_mean=self.initial_mean,
+                                     initial_covariance=self.initial_cov,
+                                     dynamics_weights=get_trans_mat,
+                                     dynamics_input_weights=jnp.zeros((self.dim_state, 1)),
+                                     dynamics_bias=jnp.zeros(self.dim_state),
+                                     dynamics_covariance=get_sparse_cov,
+                                     emission_weights=self.obs_mat,
+                                     emission_input_weights=jnp.eye(self.dim_obs),
+                                     emission_bias=jnp.zeros(self.dim_obs),
+                                     emission_covariance=params['obs_model']['cov'])
         elif self.obs_distribution == 'Poisson':
             # Current formulation of the dynamics function cannot depends on t
             trans_mat = get_trans_mat(0)
             sparse_cov = get_sparse_cov(0)
-            return GGSSMParams(initial_mean=self.initial_mean,
+            return ParamsGGSSM(initial_mean=self.initial_mean,
                                initial_covariance=self.initial_cov,
                                dynamics_function=lambda z: trans_mat @ z,
                                dynamics_covariance=sparse_cov,

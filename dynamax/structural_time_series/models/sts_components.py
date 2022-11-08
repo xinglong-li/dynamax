@@ -272,8 +272,8 @@ class Autoregressive(STSComponent):
         if self.order == 1:
             trans_mat = params['coef'][:, None]
         else:
-            trans_mat = jnp.concatenate(
-                (params['coef'][:, None], jnp.eye(self.order)[:, :-1]), axis=1)
+            trans_mat = jnp.concatenate((params['coef'][:, None],
+                                         jnp.eye(self.order)[:, :-1]), axis=1)
         return jnp.kron(trans_mat, jnp.eye(self.dim_obs))
 
     def get_trans_cov(self, params, t):
