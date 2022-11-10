@@ -74,39 +74,39 @@ def log_det_jac_constrain(unc_params, fixed_params, param_props):
     return log_det_jac
 
 
-def flatten(params):
-    """Flatten the (unconstrained) parameters to an 1-d numpy array.
+# def flatten(params):
+#     """Flatten the (unconstrained) parameters to an 1-d numpy array.
 
-    Returns:
-        params_flat: flat parameters
-        structure (dict): structure information of parameters, used to unflatten the parameters.
-    """
-    # Flatten the tree of parameters into leaves
-    tree_flat, tree_structure = tree_flatten(params)
-    # Flatten leaves of the tree
-    array_shapes = [x.shape for x in tree_flat]
-    params_flat = jnp.concatenate([x.flatten() for x in tree_flat])
+#     Returns:
+#         params_flat: flat parameters
+#         structure (dict): structure information of parameters, used to unflatten the parameters.
+#     """
+#     # Flatten the tree of parameters into leaves
+#     tree_flat, tree_structure = tree_flatten(params)
+#     # Flatten leaves of the tree
+#     array_shapes = [x.shape for x in tree_flat]
+#     params_flat = jnp.concatenate([x.flatten() for x in tree_flat])
 
-    return params_flat, {'array_shapes': array_shapes, 'tree_structure': tree_structure}
+#     return params_flat, {'array_shapes': array_shapes, 'tree_structure': tree_structure}
 
 
-def unflatten(structure, params_flat):
-    """Unflatten the (unconstrained) parameters.
+# def unflatten(structure, params_flat):
+#     """Unflatten the (unconstrained) parameters.
 
-    Args:
-        params_flat: flat parameters
-        structure (dict): structure information of parameters
-    Returns:
-        params: (unconstrained) parameters
-    """
-    array_shapes = structure['array_shapes']
-    tree_structure = structure['tree_structure']
-    # Restore leaves of the parameter tree, each leave is a numpy array
-    _sizes = jnp.cumsum(jnp.array([jnp.array(x).prod() for x in array_shapes]))
-    cum_sizes = jnp.concatenate([jnp.zeros(1), _sizes]).astype(int)
-    arrays = [params_flat[cum_sizes[i]:cum_sizes[i+1]].reshape(array_shapes[i])
-              for i in range(len(cum_sizes)-1)]
-    # Restore the tree of parameters
-    params = tree_unflatten(tree_structure, arrays)
+#     Args:
+#         params_flat: flat parameters
+#         structure (dict): structure information of parameters
+#     Returns:
+#         params: (unconstrained) parameters
+#     """
+#     array_shapes = structure['array_shapes']
+#     tree_structure = structure['tree_structure']
+#     # Restore leaves of the parameter tree, each leave is a numpy array
+#     _sizes = jnp.cumsum(jnp.array([jnp.array(x).prod() for x in array_shapes]))
+#     cum_sizes = jnp.concatenate([jnp.zeros(1), _sizes]).astype(int)
+#     arrays = [params_flat[cum_sizes[i]:cum_sizes[i+1]].reshape(array_shapes[i])
+#               for i in range(len(cum_sizes)-1)]
+#     # Restore the tree of parameters
+#     params = tree_unflatten(tree_structure, arrays)
 
-    return params
+#     return params

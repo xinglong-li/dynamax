@@ -1,12 +1,9 @@
-import blackjax
+from jax import lax, vmap
 from collections import OrderedDict
 from functools import partial
-from jax import jit, lax, vmap
 import jax.numpy as jnp
 import jax.random as jr
 import jax.scipy as jsp
-from jaxopt import LBFGS
-from jax.tree_util import tree_map
 from dynamax.abstractions import SSM
 from dynamax.generalized_gaussian_ssm.conditional_moments_gaussian_filter import (
     iterated_conditional_moments_gaussian_filter as cmgf_filt,
@@ -18,18 +15,8 @@ from dynamax.linear_gaussian_ssm.inference import (
     lgssm_filter,
     lgssm_smoother,
     lgssm_posterior_sample)
-from dynamax.parameters import (
-    to_unconstrained,
-    from_unconstrained,
-    log_det_jac_constrain,
-    flatten,
-    unflatten)
-from dynamax.utils import (
-    pytree_stack,
-    ensure_array_has_batch_dim)
 from tensorflow_probability.substrates.jax.distributions import (
     MultivariateNormalFullCovariance as MVN,
-    MultivariateNormalDiag as MVNDiag,
     Poisson as Pois)
 
 
@@ -97,7 +84,7 @@ class StructuralTimeSeriesSSM(SSM):
         return (self.dim_obs,)
 
     @property
-    def covariates_shape(self):
+    def inputs_shape(self):
         return (self.dim_covariate,)
 
     def log_prior(self, params):
@@ -243,144 +230,6 @@ class StructuralTimeSeriesSSM(SSM):
             _loc += c_dim
         return component_pos
 
-    def fit_vi(self,
-               initial_params,
-               param_props,
-               key,
-               sample_size,
-               emissions,
-               covariates=None,
-               M=100):
-        """
-        ADVI approximate the posterior distribtuion p of unconstrained global parameters
-        with factorized multivatriate normal distribution:
-        q = \prod_{k=1}^{K} q_k(mu_k, sigma_k),
-        where K is dimension of p.
-
-        The hyper-parameters of q to be optimized over are (mu_k, log_sigma_k))_{k=1}^{K}.
-
-        The trick of reparameterization is employed to reduce the variance of SGD,
-        which is achieved by written KL(q || p) as expectation over standard normal distribution
-        so a sample from q is obstained by
-        s = z * exp(log_sigma_k) + mu_k,
-        where z is a sample from the standard multivarate normal distribtion.
-
-        This implementation of ADVI uses fixed samples from q during fitting, instead of
-        updating samples from q in each iteration, as in SGD.
-        So the second order fixed optimization algorithm L-BFGS is used.
-
-        Args:
-            sample_size (int): number of samples to be returned from the fitted approxiamtion q.
-            M (int): number of fixed samples from q used in evaluation of ELBO.
-
-        Returns:
-            Samples from the approximate posterior q
-        """
-        # Make sure the emissions and covariates have batch dimensions
-        batch_emissions = ensure_array_has_batch_dim(emissions, self.emission_shape)
-        batch_covariates = ensure_array_has_batch_dim(covariates, self.covariates_shape)
-
-        initial_unc_params, fixed_params = to_unconstrained(initial_params, param_props)
-
-        params_flat, params_structure = flatten(initial_unc_params)
-        vi_dim = len(params_flat)
-
-        # Fixed samples from q.
-        key0, key1 = jr.split(key, 2)
-        std_normal = MVNDiag(jnp.zeros(vi_dim), jnp.ones(vi_dim))
-        std_samples = std_normal.sample(seed=key0, sample_shape=(M,))
-        std_samples = vmap(unflatten, (None, 0))(params_structure, std_samples)
-
-        @jit
-        def unnorm_log_pos(_unc_params):
-            params = from_unconstrained(_unc_params, fixed_params, param_props)
-            log_det_jac = log_det_jac_constrain(_unc_params, fixed_params, param_props)
-            log_pri = self.log_prior(params) + log_det_jac
-            batch_lls = vmap(partial(self.marginal_log_prob, params))(batch_emissions, batch_covariates)
-            lp = log_pri + batch_lls.sum()
-            return lp
-
-        @jit
-        def _samp_elbo(vi_params, std_samp):
-            """Evaluate ELBO at one sample from the approximate distribution q.
-            """
-            unc_params = tree_map(lambda x, y: y[0] + x*jnp.exp(y[1]),
-                                  std_samp, vi_params)
-            q_entropy = flatten(vi_params)[0].sum()
-            return q_entropy + unnorm_log_pos(unc_params)
-
-        objective = lambda x: -vmap(_samp_elbo, (None, 0))(x, std_samples).mean()
-
-        # Fit ADVI with LBFGS algorithm
-        initial_vi_means = initial_unc_params
-        initial_vi_log_sigmas = unflatten(params_structure, jnp.zeros(vi_dim))
-        initial_vi_params = vmap(lambda x, y: (x, y), initial_vi_means, initial_vi_log_sigmas)
-        lbfgs = LBFGS(fun=objective)
-        vi_params, _info = lbfgs.run(initial_vi_params)
-
-        # Sample from the learned approximate posterior q
-        _samples = std_normal.sample(seed=key1, sample_shape=(sample_size,))
-        _vi_means = flatten(vi_params)[0]
-        _vi_log_sigmas = flatten(vi_params)[0]
-        vi_samples_flat = _vi_means + _samples * jnp.exp(_vi_log_sigmas)
-        vi_unc_samples = vmap(unflatten, (None, 0))(params_structure, vi_samples_flat)
-        vi_samples = vmap(from_unconstrained, (0, None, None))(
-            vi_unc_samples, fixed_params, self.param_props)
-
-        return vi_samples
-
-    def fit_hmc(self,
-                initial_params,
-                param_props,
-                key,
-                num_samples,
-                emissions,
-                covariates=None,
-                warmup_steps=100,
-                verbose=True):
-        """Sample parameters of the model using HMC.
-        """
-        # Make sure the emissions and covariates have batch dimensions
-        batch_emissions = ensure_array_has_batch_dim(emissions, self.emission_shape)
-        batch_covariates = ensure_array_has_batch_dim(covariates, self.covariates_shape)
-
-        initial_unc_params, fixed_params = to_unconstrained(initial_params, param_props)
-
-        # The log likelihood that the HMC samples from
-        def unnorm_log_pos(_unc_params):
-            params = from_unconstrained(_unc_params, fixed_params, param_props)
-            log_det_jac = log_det_jac_constrain(_unc_params, fixed_params, param_props)
-            log_pri = self.log_prior(params) + log_det_jac
-            batch_lls = vmap(partial(self.marginal_log_prob, params))(batch_emissions, batch_covariates)
-            lp = log_pri + batch_lls.sum()
-            return lp
-
-        # Initialize the HMC sampler using window_adaptations
-        warmup = blackjax.window_adaptation(blackjax.nuts, unnorm_log_pos, num_steps=warmup_steps)
-        init_key, key = jr.split(key)
-        hmc_initial_state, hmc_kernel, _ = warmup.run(init_key, initial_unc_params)
-
-        @jit
-        def hmc_step(hmc_state, step_key):
-            next_hmc_state, _ = hmc_kernel(step_key, hmc_state)
-            params = from_unconstrained(hmc_state.position, fixed_params, param_props)
-            return next_hmc_state, params
-
-        # Start sampling.
-        log_probs = []
-        samples = []
-        hmc_state = hmc_initial_state
-        # pbar = trange(num_samples) if verbose else range(num_samples)
-        pbar = range(num_samples)
-        for _ in pbar:
-            step_key, key = jr.split(key)
-            hmc_state, params = hmc_step(hmc_state, step_key)
-            log_probs.append(-hmc_state.potential_energy)
-            samples.append(params)
-
-        # Combine the samples into a single pytree
-        return pytree_stack(samples), jnp.array(log_probs)
-
     def forecast(self,
                  params,
                  obs_time_series,
@@ -491,7 +340,8 @@ class StructuralTimeSeriesSSM(SSM):
                                      emission_weights=self.obs_mat,
                                      emission_input_weights=jnp.eye(self.dim_obs),
                                      emission_bias=jnp.zeros(self.dim_obs),
-                                     emission_covariance=params['obs_model']['cov'])
+                                     emission_covariance=params['obs_model']['cov']
+                                     )
         elif self.obs_distribution == 'Poisson':
             # Current formulation of the dynamics function cannot depends on t
             trans_mat = get_trans_mat(0)
@@ -504,7 +354,8 @@ class StructuralTimeSeriesSSM(SSM):
                                    lambda z: self._emission_constrainer(self.obs_mat @ z),
                                emission_cov_function=
                                    lambda z: jnp.diag(self._emission_constrainer(self.obs_mat @ z)),
-                               emission_dist=lambda mu, _: Pois(log_rate=jnp.log(mu)))
+                               emission_dist=lambda mu, _: Pois(log_rate=jnp.log(mu))
+                               )
 
     def _ssm_filter(self, params, emissions, inputs):
         """The filter of the corresponding SSM model.

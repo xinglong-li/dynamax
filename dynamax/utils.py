@@ -51,7 +51,7 @@ def pytree_len(pytree):
     if pytree is None:
         return 0
     else:
-        return len(tree_leaves(pytree)[0])
+        return len(tree_leaves(pytree))
 
 
 def pytree_sum(pytree, axis=None, keepdims=None, where=None):
