@@ -1,11 +1,13 @@
 import blackjax
+from collections import OrderedDict
 from fastprogress.fastprogress import progress_bar
 from functools import partial
-from jax import jit, vmap
+from jax import jit, lax, vmap, value_and_grad
 import jax.numpy as jnp
 import jax.random as jr
 from jax.tree_util import tree_map, tree_flatten, tree_leaves
-from jaxopt import LBFGS
+import jax.scipy.stats.norm as norm
+import optax
 from dynamax.parameters import to_unconstrained, from_unconstrained, log_det_jac_constrain
 from dynamax.utils import ensure_array_has_batch_dim, pytree_slice, pytree_stack
 
@@ -13,11 +15,13 @@ from dynamax.utils import ensure_array_has_batch_dim, pytree_slice, pytree_stack
 def fit_vi(model,
            initial_params,
            param_props,
-           sample_size,
+           num_samples,
            emissions,
            inputs=None,
+           optimizer=optax.adam(1e-1),
+           K=1,
            key=jr.PRNGKey(0),
-           M=100):
+           num_mstep_iters=50):
     """
     ADVI approximate the posterior distribtuion p of unconstrained global parameters
     with factorized multivatriate normal distribution:
@@ -43,16 +47,12 @@ def fit_vi(model,
     Returns:
         Samples from the approximate posterior q
     """
-    keys = iter(jr.split(key, 3*len(tree_leaves(initial_params))))
-
+    key1, key2 = jr.split(key, 2)
     # Make sure the emissions and covariates have batch dimensions
     batch_emissions = ensure_array_has_batch_dim(emissions, model.emission_shape)
     batch_inputs = ensure_array_has_batch_dim(inputs, model.inputs_shape)
 
-    curr_unc_params, fixed_params = to_unconstrained(initial_params, param_props)
-
-    # standard nornal samples
-    std_samples = tree_map(lambda x: jr.normal(next(keys), (M, *x.shape)), curr_unc_params)
+    initial_unc_params, fixed_params = to_unconstrained(initial_params, param_props)
 
     @jit
     def unnorm_log_pos(_unc_params):
@@ -60,37 +60,57 @@ def fit_vi(model,
         log_det_jac = log_det_jac_constrain(_unc_params, fixed_params, param_props)
         log_pri = model.log_prior(params) + log_det_jac
         batch_lls = vmap(partial(model.marginal_log_prob, params))(batch_emissions, batch_inputs)
-        lp = log_pri + batch_lls.sum()
+        lp = batch_lls.sum() + log_pri
         return lp
 
     @jit
-    def neg_elbo(vi_hyper):
-        """Evaluate negative ELBO at fixed samples from the approximate distribution q.
+    def elbo(vi_hyper, key):
+        """Evaluate negative ELBO at fixed sample from the approximate distribution q.
         """
+        keys = iter(jr.split(key, 10))
         # Turn VI parameters and fixed noises into samples of unconstrained parameters of q.
-        unc_params = lambda samp: tree_map(lambda p, s: p[0] + jnp.exp(p[1])*s, vi_hyper, samp)
-        log_probs = jnp.array([unnorm_log_pos(unc_params(pytree_slice(std_samples, i)))
-                               for i in range(M)]).mean()
-        vi_hyper_flat = tree_leaves(vi_hyper)
-        q_entropy = jnp.array([p[1].sum() for p in vi_hyper_flat]).sum()
-        return -(log_probs + q_entropy)
+        unc_params = tree_map(lambda mu, ls: mu + jnp.exp(ls) * jr.normal(next(keys), ls.shape).sum(),
+                              vi_hyper['mu'], vi_hyper['log_sig'])
+        unc_params = vi_hyper['mu']
+        log_probs = unnorm_log_pos(unc_params)
+        log_q = jnp.array(tree_leaves(tree_map(lambda x, *p: norm.logpdf(x, p[0], jnp.exp(p[1])).sum(),
+                                               unc_params, vi_hyper['mu'], vi_hyper['log_sig']))).sum()
+        return log_probs - log_q
+
+    loss_fn = lambda vi_hyp, key: -jnp.mean(vmap(partial(elbo, vi_hyp))(jr.split(key, K)))
 
     # Fit ADVI with LBFGS algorithm
-    curr_vi_means = curr_unc_params
-    curr_vi_log_sigmas = tree_map(lambda x: jnp.zeros(x.shape), curr_unc_params)
-    curr_vi_hyper = tree_map(lambda x, y: jnp.stack((x, y)), curr_vi_means, curr_vi_log_sigmas)
-    lbfgs = LBFGS(fun=neg_elbo)
-    vi_hyp_fitted, _info = lbfgs.run(curr_vi_hyper)
+    curr_vi_mus = initial_unc_params
+    curr_vi_log_sigs = tree_map(lambda x: jnp.zeros(x.shape), initial_unc_params)
+    curr_vi_hyper = OrderedDict()
+    curr_vi_hyper['mu'] = curr_vi_mus
+    curr_vi_hyper['log_sig'] = curr_vi_log_sigs
 
-    # Sample from the learned approximate posterior q
-    vi_unc_samples = tree_map(
-        lambda p: p[0] + jnp.exp(p[1])*jr.normal(next(keys), (sample_size, *p[0].shape)),
-        vi_hyp_fitted)
-    _samples = [from_unconstrained(pytree_slice(vi_unc_samples, i), fixed_params, param_props)
-                for i in range(sample_size)]
-    vi_samples = pytree_stack(_samples)
+    # Optimize
+    opt_state = optimizer.init(curr_vi_hyper)
+    loss_grad_fn = value_and_grad(loss_fn)
 
-    return vi_samples
+    def train_step(carry, key):
+        vi_hyp, opt_state = carry
+        loss, grads = loss_grad_fn(vi_hyp, key)
+        updates, opt_state = optimizer.update(grads, opt_state)
+        vi_hyp = optax.apply_updates(vi_hyp, updates)
+        return (vi_hyp, opt_state), loss
+    # Run the optimizer
+    initial_carry = (curr_vi_hyper, opt_state)
+    (vi_hyp_fitted, opt_state), losses = lax.scan(
+        train_step, initial_carry, jr.split(key1, num_mstep_iters))
+
+    # # Sample from the learned approximate posterior q
+    # vi_sample = lambda key: from_unconstrained(
+    #     tree_map(lambda mu, s: mu + jnp.exp(s)*jr.normal(key, s.shape),
+    #              vi_hyp_fitted['mu'], vi_hyp_fitted['log_sig']),
+    #     fixed_params,
+    #     param_props)
+    # samples = vmap(vi_sample)(jr.split(key2, num_samples))
+
+    # return samples, losses
+    return from_unconstrained(vi_hyp_fitted, fixed_params, param_props), losses
 
 
 def fit_hmc(model,
