@@ -24,18 +24,6 @@ author = 'Peter Chang, Giles Harper-Donnelly, Aleyna Kara, Xinglong Li, Scott Li
 
 # -- General configuration ---------------------------------------------------
 
-# Add any Sphinx extension module names here, as strings. They can be
-# extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
-# ones.
-# extensions = [
-#     "sphinx.ext.autodoc",
-#     "sphinx_autodoc_typehints",
-#     "sphinx.ext.autosummary",
-#     "sphinx.ext.mathjax",
-#     "myst_nb",
-#     # "myst_parser"
-# ]
-
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
@@ -93,13 +81,14 @@ html_logo = "../logo/logo.gif"
 html_theme = 'sphinx_book_theme'
 html_theme_options = {
     'repository_url': 'https://github.com/probml/dynamax',
+    "use_repository_button": True,
+    "use_download_button": False,
     'repository_branch': 'main',
     "path_to_docs": 'docs',
     'launch_buttons': {
         'colab_url': 'https://colab.research.google.com',
         'binderhub_url': 'https://mybinder.org'
     },
-    'logo_only': True,
 }
 
 # Add any paths that contain custom static files (such as style sheets) here,
