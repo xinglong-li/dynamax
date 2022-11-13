@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import jax.scipy as jsp
 from dynamax.abstractions import SSM
-from dynamax.generalized_gaussian_ssm.conditional_moments_gaussian_filter import (
+from dynamax.generalized_gaussian_ssm.inference import (
     iterated_conditional_moments_gaussian_filter as cmgf_filt,
     iterated_conditional_moments_gaussian_smoother as cmgf_smooth,
     EKFIntegrals)
@@ -354,7 +354,7 @@ class StructuralTimeSeriesSSM(SSM):
                                    lambda z: self._emission_constrainer(self.obs_mat @ z),
                                emission_cov_function=
                                    lambda z: jnp.diag(self._emission_constrainer(self.obs_mat @ z)),
-                               emission_dist=lambda mu, _: Pois(log_rate=jnp.log(mu))
+                               emission_dist=lambda mu, Sigma: Pois(log_rate=jnp.log(mu))
                                )
 
     def _ssm_filter(self, params, emissions, inputs):
