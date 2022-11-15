@@ -5,8 +5,9 @@ from tensorflow_probability.substrates.jax.distributions import MultivariateNorm
 from jaxtyping import Array, Float
 from typing import Optional
 
-from dynamax.nonlinear_gaussian_ssm.models import PosteriorNLGSSMFiltered, PosteriorNLGSSMSmoothed, ParamsNLGSSM
-
+from dynamax.utils.utils import psd_solve
+from dynamax.nonlinear_gaussian_ssm.models import ParamsNLGSSM
+from dynamax.linear_gaussian_ssm.inference import PosteriorGSSMFiltered, PosteriorGSSMSmoothed
 
 # Helper functions
 _get_params = lambda x, dim, t: x[t] if x.ndim == dim + 1 else x
@@ -15,10 +16,10 @@ _process_input = lambda x, y: jnp.zeros((y,1)) if x is None else x
 
 
 def _predict(m, P, f, F, Q, u):
-    """Predict next mean and covariance using first-order additive EKF
+    r"""Predict next mean and covariance using first-order additive EKF
 
-        p(x_{t+1}) = \int N(x_t | m, S) N(x_{t+1} | f(x_t, u), Q)
-                    = N(x_{t+1} | f(m, u), F(m, u) S F(m, u)^T + Q)
+        p(z_{t+1}) = \int N(z_t | m, S) N(z_{t+1} | f(z_t, u), Q)
+                    = N(z_{t+1} | f(m, u), F(m, u) S F(m, u)^T + Q)
 
     Args:
         m (D_hid,): prior mean.
@@ -39,11 +40,12 @@ def _predict(m, P, f, F, Q, u):
 
 
 def _condition_on(m, P, h, H, R, u, y, num_iter):
-    """Condition a Gaussian potential on a new observation
-       p(x_t | y_t, u_t, y_{1:t-1}, u_{1:t-1})
-         propto p(x_t | y_{1:t-1}, u_{1:t-1}) p(y_t | x_t, u_t)
-         = N(x_t | m, S) N(y_t | h_t(x_t, u_t), R_t)
-         = N(x_t | mm, SS)
+    r"""Condition a Gaussian potential on a new observation.
+
+       p(z_t | y_t, u_t, y_{1:t-1}, u_{1:t-1})
+         propto p(z_t | y_{1:t-1}, u_{1:t-1}) p(y_t | z_t, u_t)
+         = N(z_t | m, S) N(y_t | h_t(z_t, u_t), R_t)
+         = N(z_t | mm, SS)
      where
          mm = m + K*(y - yhat) = mu_cond
          yhat = h(m, u)
@@ -70,7 +72,7 @@ def _condition_on(m, P, h, H, R, u, y, num_iter):
         prior_mean, prior_cov = carry
         H_x = H(prior_mean, u)
         S = R + H_x @ prior_cov @ H_x.T
-        K = jnp.linalg.solve(S, H_x @ prior_cov).T
+        K = psd_solve(S, H_x @ prior_cov).T
         posterior_cov = prior_cov - K @ S @ K.T
         posterior_mean = prior_mean + K @ (y - h(prior_mean, u))
         return (posterior_mean, posterior_cov), None
@@ -86,21 +88,18 @@ def extended_kalman_filter(
     emissions: Float[Array, "ntime emission_dim"],
     num_iter: int = 1,
     inputs: Optional[Float[Array, "ntime input_dim"]]=None
-) -> PosteriorNLGSSMFiltered:
-    """Run an (iterated) extended Kalman filter to produce the
+) -> PosteriorGSSMFiltered:
+    r"""Run an (iterated) extended Kalman filter to produce the
     marginal likelihood and filtered state estimates.
 
     Args:
-        params: an NLGSSMParams instance (or object with the same fields)
-        emissions (T,D_hid): array of observations.
-        num_iter (int): number of linearizations around posterior for update step.
-        inputs (T,D_in): array of inputs.
+        params: model parameters.
+        emissions: observation sequence.
+        num_iter: number of linearizations around posterior for update step (default 1).
+        inputs: optional array of inputs.
 
     Returns:
-        filtered_posterior: GSSMPosterior instance containing,
-            marginal_log_lik
-            filtered_means (T, D_hid)
-            filtered_covariances (T, D_hid, D_hid)
+        post: posterior object.
 
     """
     num_timesteps = len(emissions)
@@ -134,7 +133,7 @@ def extended_kalman_filter(
     # Run the extended Kalman filter
     carry = (0.0, params.initial_mean, params.initial_covariance)
     (ll, _, _), (filtered_means, filtered_covs) = lax.scan(_step, carry, jnp.arange(num_timesteps))
-    return PosteriorNLGSSMFiltered(marginal_loglik=ll, filtered_means=filtered_means, filtered_covariances=filtered_covs)
+    return PosteriorGSSMFiltered(marginal_loglik=ll, filtered_means=filtered_means, filtered_covariances=filtered_covs)
 
 
 def iterated_extended_kalman_filter(
@@ -142,20 +141,18 @@ def iterated_extended_kalman_filter(
     emissions:  Float[Array, "ntime emission_dim"],
     num_iter: int = 2,
     inputs: Optional[Float[Array, "ntime input_dim"]] = None
-) -> PosteriorNLGSSMFiltered:
-    """Run an iterated extended Kalman filter (IEKF).
+) -> PosteriorGSSMFiltered:
+    r"""Run an iterated extended Kalman filter to produce the
+    marginal likelihood and filtered state estimates.
 
     Args:
-        params: an NLGSSMParams instance (or object with the same fields)
-        emissions (T,D_hid): array of observations.
-        num_iter (int): number of linearizations around smoothed posterior.
-        inputs (T,D_in): array of inputs.
+        params: model parameters.
+        emissions: observation sequence.
+        num_iter: number of linearizations around posterior for update step (default 2).
+        inputs: optional array of inputs.
 
     Returns:
-        filtered_posterior: GSSMPosterior instance containing,
-            marginal_log_lik
-            filtered_means (T, D_hid)
-            filtered_covariances (T, D_hid, D_hid)
+        post: posterior object.
 
     """
     filtered_posterior = extended_kalman_filter(params, emissions, num_iter, inputs)
@@ -165,25 +162,19 @@ def iterated_extended_kalman_filter(
 def extended_kalman_smoother(
     params: ParamsNLGSSM,
     emissions:  Float[Array, "ntime emission_dim"],
-    filtered_posterior: Optional[PosteriorNLGSSMFiltered] = None,
+    filtered_posterior: Optional[PosteriorGSSMFiltered] = None,
     inputs: Optional[Float[Array, "ntime input_dim"]] = None
-) -> PosteriorNLGSSMSmoothed:
-    """Run an extended Kalman (RTS) smoother.
+) -> PosteriorGSSMSmoothed:
+    r"""Run an extended Kalman (RTS) smoother.
 
     Args:
-        params: an NLGSSMParams instance (or object with the same fields)
-
-        emissions (T,D_hid): array of observations.
-
-        filtered_posterior (GSSMPosterior): filtered posterior to use for smoothing.
-        If None, the smoother computes the filtered posterior directly.
-
-        inputs (T,D_in): array of inputs.
+        params: model parameters.
+        emissions: observation sequence.
+        filtered_posterior: optional output from filtering step.
+        inputs: optional array of inputs.
 
     Returns:
-
-        nlgssm_posterior: GSSMPosterior instance containing properties of
-        filtered and smoothed posterior distributions.
+        post: posterior object.
 
     """
     num_timesteps = len(emissions)
@@ -213,7 +204,7 @@ def extended_kalman_smoother(
         # Prediction step
         m_pred = f(filtered_mean, u)
         S_pred = Q + F_x @ filtered_cov @ F_x.T
-        G = jnp.linalg.solve(S_pred, F_x @ filtered_cov).T
+        G = psd_solve(S_pred, F_x @ filtered_cov).T
 
         # Compute smoothed mean and covariance
         smoothed_mean = filtered_mean + G @ (smoothed_mean_next - m_pred)
@@ -229,7 +220,7 @@ def extended_kalman_smoother(
     # Reverse the arrays and return
     smoothed_means = jnp.row_stack((smoothed_means[::-1], filtered_means[-1][None, ...]))
     smoothed_covs = jnp.row_stack((smoothed_covs[::-1], filtered_covs[-1][None, ...]))
-    return PosteriorNLGSSMSmoothed(
+    return PosteriorGSSMSmoothed(
         marginal_loglik=ll,
         filtered_means=filtered_means,
         filtered_covariances=filtered_covs,
@@ -243,18 +234,17 @@ def iterated_extended_kalman_smoother(
     emissions:  Float[Array, "ntime emission_dim"],
     num_iter: int = 2,
     inputs: Optional[Float[Array, "ntime input_dim"]] = None
-) -> PosteriorNLGSSMSmoothed:
-    """Run an iterated extended Kalman smoother (IEKS).
+) -> PosteriorGSSMSmoothed:
+    r"""Run an iterated extended Kalman smoother (IEKS).
 
     Args:
-        params: an NLGSSMParams instance (or object with the same fields)
-        emissions (T,D_hid): array of observations.
-        num_iter (int): number of re-linearizations around smoothed posterior.
-        inputs (T,D_in): array of inputs.
+        params: model parameters.
+        emissions: observation sequence.
+        num_iter: number of linearizations around posterior for update step (default 2).
+        inputs: optional array of inputs.
 
     Returns:
-        nlgssm_posterior: GSSMPosterior instance containing properties of
-            filtered and smoothed posterior distributions.
+        post: posterior object.
 
     """
 

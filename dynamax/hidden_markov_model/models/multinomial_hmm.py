@@ -1,14 +1,19 @@
+from typing import NamedTuple, Optional, Tuple, Union
+
 import jax.numpy as jnp
 import jax.random as jr
 import tensorflow_probability.substrates.jax.bijectors as tfb
 import tensorflow_probability.substrates.jax.distributions as tfd
-from jaxtyping import Float, Array
-from dynamax.parameters import ParameterProperties
+from jaxtyping import Array, Float
+
 from dynamax.hidden_markov_model.models.abstractions import HMM, HMMEmissions
-from dynamax.hidden_markov_model.models.initial import StandardHMMInitialState, ParamsStandardHMMInitialState
-from dynamax.hidden_markov_model.models.transitions import StandardHMMTransitions, ParamsStandardHMMTransitions
+from dynamax.hidden_markov_model.models.initial import ParamsStandardHMMInitialState
+from dynamax.hidden_markov_model.models.initial import StandardHMMInitialState
+from dynamax.hidden_markov_model.models.transitions import ParamsStandardHMMTransitions
+from dynamax.hidden_markov_model.models.transitions import StandardHMMTransitions
+from dynamax.parameters import ParameterProperties, ParameterSet, PropertySet
+from dynamax.types import Scalar
 from dynamax.utils.utils import pytree_sum
-from typing import NamedTuple, Union
 
 
 class ParamsMultinomialHMMEmissions(NamedTuple):
@@ -83,28 +88,51 @@ class ParamsMultinomialHMM(NamedTuple):
     emissions: ParamsMultinomialHMMEmissions
 
 class MultinomialHMM(HMM):
+    r"""An HMM with conditionally independent multinomial emissions.
 
+    Let $y_{t,n} \in \mathbb{N}^C$ denote a vector of $C$ counts for each of $N$
+    conditionally independent multinomial emissions at time $t$. In this model,the emission
+    distribution is,
+
+    $$p(y_t \mid z_t, \theta) = \prod_{n=1}^N \mathrm{Mult}(y_{tn} \mid R, \theta_{z_t,n})$$
+    $$p(\theta) = \prod_{k=1}^K \prod_{n=1}^N \mathrm{Dir}(\theta_{k,n}; \gamma 1_C)$$
+
+    with $\theta_{k,n} \in \Delta_C$ for $k=1,\ldots,K$ and $n=1,\ldots,N$ are the
+    *emission probabilities* and $\gamma$ is their prior concentration.
+
+    :param num_states: number of discrete states $K$
+    :param emission_dim: number of conditionally independent emissions $N$
+    :param num_classes: number of multinomial classes $C$
+    :param num_trials: number of multinomial trials $R$
+    :param initial_probs_concentration: $\alpha$
+    :param transition_matrix_concentration: $\beta$
+    :param transition_matrix_stickiness: optional hyperparameter to boost the concentration on the diagonal of the transition matrix.
+    :param emission_prior_concentration: $\gamma$
+
+    """
     def __init__(self,
                  num_states,
                  emission_dim,
                  num_classes,
                  num_trials,
-                 initial_probs_concentration=1.1,
-                 transition_matrix_concentration=1.1,
-                 emission_prior_concentration=1.1):
+                 initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
+                 transition_matrix_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
+                 transition_matrix_stickiness: Scalar=0.0,
+                 emission_prior_concentration: Scalar=1.1):
         self.emission_dim = emission_dim
         self.num_classes = num_classes
         self.num_trials = num_trials
         initial_component = StandardHMMInitialState(num_states, initial_probs_concentration=initial_probs_concentration)
-        transition_component = StandardHMMTransitions(num_states, transition_matrix_concentration=transition_matrix_concentration)
+        transition_component = StandardHMMTransitions(num_states, concentration=transition_matrix_concentration, stickiness=transition_matrix_stickiness)
         emission_component = MultinomialHMMEmissions(num_states, emission_dim, num_classes, num_trials, emission_prior_concentration=emission_prior_concentration)
         super().__init__(num_states, initial_component, transition_component, emission_component)
 
     def initialize(self, key=jr.PRNGKey(0),
                    method="prior",
-                   initial_probs=None,
-                   transition_matrix=None,
-                   emission_probs=None):
+                   initial_probs: Optional[Float[Array, "num_states"]]=None,
+                   transition_matrix: Optional[Float[Array, "num_states num_states"]]=None,
+                   emission_probs: Optional[Float[Array, "num_states emission_dim num_classes"]]=None
+    ) -> Tuple[ParameterSet, PropertySet]:
         """Initialize the model parameters and their corresponding properties.
 
         You can either specify parameters manually via the keyword arguments, or you can have
@@ -114,15 +142,14 @@ class MultinomialHMM(HMM):
         Note: in the future we may support more initialization schemes, like K-Means.
 
         Args:
-            key (PRNGKey, optional): random number generator for unspecified parameters. Must not be None if there are any unspecified parameters. Defaults to jr.PRNGKey(0).
+            key (PRNGKey, optional): random number generator for unspecified parameters. Must not be None if there are any unspecified parameters. Defaults to None.
             method (str, optional): method for initializing unspecified parameters. Currently, only "prior" is allowed. Defaults to "prior".
             initial_probs (array, optional): manually specified initial state probabilities. Defaults to None.
             transition_matrix (array, optional): manually specified transition matrix. Defaults to None.
             emission_probs (array, optional): manually specified emission probabilities. Defaults to None.
 
         Returns:
-            params: nested dataclasses of arrays containing model parameters.
-            props: a nested dictionary of ParameterProperties to specify parameter constraints and whether or not they should be trained.
+            Model parameters and their properties.
         """
         key1, key2, key3 = jr.split(key , 3)
         params, props = dict(), dict()

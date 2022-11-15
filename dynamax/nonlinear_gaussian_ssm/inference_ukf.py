@@ -4,11 +4,14 @@ from jax import vmap
 from tensorflow_probability.substrates.jax.distributions import MultivariateNormalFullCovariance as MVN
 from jaxtyping import Array, Float
 from typing import NamedTuple, Optional
-from dynamax.nonlinear_gaussian_ssm.models import PosteriorNLGSSMFiltered, PosteriorNLGSSMSmoothed, ParamsNLGSSM
 
+from dynamax.utils.utils import psd_solve
+from dynamax.nonlinear_gaussian_ssm.models import  ParamsNLGSSM
+from dynamax.linear_gaussian_ssm.models import PosteriorGSSMFiltered, PosteriorGSSMSmoothed
 
 class UKFHyperParams(NamedTuple):
     """Lightweight container for UKF hyperparameters.
+
     Default values taken from https://github.com/sbitzer/UKF-exposed
     """
     alpha: float = jnp.sqrt(3)
@@ -77,6 +80,7 @@ def _predict(m, P, f, Q, lamb, w_mean, w_cov, u):
     Returns:
         m_pred (D_hid,): predicted mean.
         P_pred (D_hid,D_hid): predicted covariance.
+        
     """
     n = len(m)
     # Form sigma points and propagate
@@ -109,6 +113,7 @@ def _condition_on(m, P, h, R, lamb, w_mean, w_cov, u, y):
         ll (float): log-likelihood of observation
         m_cond (D_hid,): filtered mean.
         P_cond (D_hid,D_hid): filtered covariance.
+
     """
     n = len(m)
     # Form sigma points and propagate
@@ -125,7 +130,7 @@ def _condition_on(m, P, h, R, lamb, w_mean, w_cov, u, y):
     ll = MVN(pred_mean, pred_cov).log_prob(y)
 
     # Compute filtered mean and covariace
-    K = jnp.linalg.solve(pred_cov, pred_cross.T).T  # Filter gain
+    K = psd_solve(pred_cov, pred_cross.T).T  # Filter gain
     m_cond = m + K @ (y - pred_mean)
     P_cond = P - K @ pred_cov @ K.T
     return ll, m_cond, P_cond
@@ -136,21 +141,19 @@ def unscented_kalman_filter(
     emissions: Float[Array, "ntime emission_dim"],
     hyperparams: UKFHyperParams,
     inputs: Optional[Float[Array, "ntime input_dim"]]=None
-) -> PosteriorNLGSSMFiltered:
+) -> PosteriorGSSMFiltered:
     """Run a unscented Kalman filter to produce the marginal likelihood and
     filtered state estimates.
 
     Args:
-        params: an NLGSSMParams instance (or object with the same fields)
-        emissions (T,D_hid): array of observations.
-        hyperperams: a UKFHyperParams instance
-        inputs (T,D_in): array of inputs.
+        params: model parameters.
+        emissions: array of observations.
+        hyperparams: hyper-parameters.
+        inputs: optional array of inputs.
 
     Returns:
-        filtered_posterior: ESSMPosterior instance containing,
-            marginal_log_lik
-            filtered_means (T, D_hid)
-            filtered_covariances (T, D_hid, D_hid)
+        filtered_posterior: posterior object.
+
     """
     num_timesteps = len(emissions)
     state_dim = params.dynamics_covariance.shape[0]
@@ -190,7 +193,7 @@ def unscented_kalman_filter(
     # Run the UKF
     carry = (0.0, params.initial_mean, params.initial_covariance)
     (ll, _, _), (filtered_means, filtered_covs) = lax.scan(_step, carry, jnp.arange(num_timesteps))
-    return PosteriorNLGSSMFiltered(marginal_loglik=ll, filtered_means=filtered_means, filtered_covariances=filtered_covs)
+    return PosteriorGSSMFiltered(marginal_loglik=ll, filtered_means=filtered_means, filtered_covariances=filtered_covs)
 
 
 def unscented_kalman_smoother(
@@ -198,18 +201,18 @@ def unscented_kalman_smoother(
     emissions: Float[Array, "ntime emission_dim"],
     hyperparams: UKFHyperParams,
     inputs: Optional[Float[Array, "ntime input_dim"]]=None
-) -> PosteriorNLGSSMSmoothed:
+) -> PosteriorGSSMSmoothed:
     """Run a unscented Kalman (RTS) smoother.
 
     Args:
-        params: an NLGSSMParams instance (or object with the same fields)
-        emissions (T,D_hid): array of observations.
-        hyperperams: a UKFHyperParams instance
-        inputs (T,D_in): array of inputs.
+        params: model parameters.
+        emissions: array of observations.
+        hyperperams: hyper-parameters.
+        inputs: optional inputs.
 
     Returns:
-        nlgssm_posterior: GSSMPosterior instance containing properties of
-            filtered and smoothed posterior distributions.
+        nlgssm_posterior: posterior object.
+
     """
     num_timesteps = len(emissions)
     state_dim = params.dynamics_covariance.shape[0]
@@ -241,7 +244,7 @@ def unscented_kalman_smoother(
 
         # Prediction step
         m_pred, S_pred, S_cross = _predict(filtered_mean, filtered_cov, f, Q, lamb, w_mean, w_cov, u)
-        G = jnp.linalg.solve(S_pred, S_cross.T).T
+        G = psd_solve(S_pred, S_cross.T).T
 
         # Compute smoothed mean and covariance
         smoothed_mean = filtered_mean + G @ (smoothed_mean_next - m_pred)
@@ -257,7 +260,7 @@ def unscented_kalman_smoother(
     # Reverse the arrays and return
     smoothed_means = jnp.row_stack((smoothed_means[::-1], filtered_means[-1][None, ...]))
     smoothed_covs = jnp.row_stack((smoothed_covs[::-1], filtered_covs[-1][None, ...]))
-    return PosteriorNLGSSMSmoothed(
+    return PosteriorGSSMSmoothed(
         marginal_loglik=ll,
         filtered_means=filtered_means,
         filtered_covariances=filtered_covs,

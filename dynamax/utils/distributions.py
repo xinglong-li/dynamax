@@ -6,16 +6,18 @@ from tensorflow_probability.substrates import jax as tfp
 tfd = tfp.distributions
 tfb = tfp.bijectors
 
+from dynamax.utils.utils import psd_solve
+
 
 class InverseWishart(tfd.TransformedDistribution):
 
     def __new__(cls, *args, **kwargs):
-        # Patch for tfp 0.18.0. 
+        # Patch for tfp 0.18.0.
         # See https://github.com/tensorflow/probability/issues/1617
         return tfd.Distribution.__new__(cls)
 
     def __init__(self, df, scale):
-        """Implementation of an inverse Wishart distribution as a transformation of
+        r"""Implementation of an inverse Wishart distribution as a transformation of
         a Wishart distribution. This distribution is defined by a scalar degrees of
         freedom `df` and a scale matrix, `scale`.
 
@@ -106,12 +108,12 @@ class InverseWishart(tfd.TransformedDistribution):
 
 class NormalInverseWishart(tfd.JointDistributionSequential):
     def __new__(cls, *args, **kwargs):
-        # Patch for tfp 0.18.0. 
+        # Patch for tfp 0.18.0.
         # See https://github.com/tensorflow/probability/issues/1617
         return tfd.Distribution.__new__(cls)
 
     def __init__(self, loc, mean_concentration, df, scale):
-        """
+        r"""
         A normal inverse Wishart (NIW) distribution with
         TODO: Finish this description
         Args:
@@ -154,11 +156,11 @@ class NormalInverseWishart(tfd.JointDistributionSequential):
         r"""Solve for the mode. Recall,
         .. math::
             p(\mu, \Sigma) \propto
-                \mathrm{N}(\mu | \mu_0, \Sigma / \kappa_0) \times
-                \mathrm{IW}(\Sigma | \nu_0, \Psi_0)
+                \mathrm{N}(\mu \mid  \mu_0, \Sigma / \kappa_0) \times
+                \mathrm{IW}(\Sigma \mid  \nu_0, \Psi_0)
         The optimal mean is :math:`\mu^* = \mu_0`. Substituting this in,
         .. math::
-            p(\mu^*, \Sigma) \propto IW(\Sigma | \nu_0 + 1, \Psi_0)
+            p(\mu^*, \Sigma) \propto IW(\Sigma \mid  \nu_0 + 1, \Psi_0)
         and the mode of this inverse Wishart distribution is at
         .. math::
             \Sigma^* = \Psi_0 / (\nu_0 + d + 2)
@@ -171,19 +173,19 @@ class NormalInverseWishart(tfd.JointDistributionSequential):
 class MatrixNormalPrecision(tfd.TransformedDistribution):
 
     def __new__(cls, *args, **kwargs):
-        # Patch for tfp 0.18.0. 
+        # Patch for tfp 0.18.0.
         # See https://github.com/tensorflow/probability/issues/1617
         return tfd.Distribution.__new__(cls)
 
     def __init__(self, loc, row_covariance, col_precision):
-        """A matrix normal distribution
+        r"""A matrix normal distribution
 
         Args:
             loc:            mean value of the matrix
-            row_covariance: covariance matrix of rows of the matrix 
+            row_covariance: covariance matrix of rows of the matrix
             col_precision:  precision matrix (inverse of covariance) of columns of the matrix
-            
-        Returns: 
+
+        Returns:
             A tfp.Distribution object.
         """
         self._shape = loc.shape
@@ -228,12 +230,12 @@ class MatrixNormalPrecision(tfd.TransformedDistribution):
 
 class MatrixNormalInverseWishart(tfd.JointDistributionSequential):
     def __new__(cls, *args, **kwargs):
-        # Patch for tfp 0.18.0. 
+        # Patch for tfp 0.18.0.
         # See https://github.com/tensorflow/probability/issues/1617
         return tfd.Distribution.__new__(cls)
-        
+
     def __init__(self, loc, col_precision, df, scale):
-        """A matrix normal inverse Wishart (MNIW) distribution
+        r"""A matrix normal inverse Wishart (MNIW) distribution
 
         Args:
             loc:           mean value matrix of the matrix normal distribution
@@ -241,8 +243,8 @@ class MatrixNormalInverseWishart(tfd.JointDistributionSequential):
                            of the matrix normal ditribution
             df:            degree of freedom parameter of the inverse Wishart distribution
             scale:         the scale matrix of the inverse Wishart distribution
-        
-        Returns: 
+
+        Returns:
             A tfp.JointDistribution object.
         """
         self._matrix_normal_shape = loc.shape
@@ -280,8 +282,8 @@ class MatrixNormalInverseWishart(tfd.JointDistributionSequential):
 
 
 def niw_posterior_update(niw_prior, sufficient_stats):
-    """Update the NormalInverseWishart (NIW) distribution using sufficient statistics
-    
+    r"""Update the NormalInverseWishart (NIW) distribution using sufficient statistics
+
     Returns:
         posterior NIW distribution
     """
@@ -302,7 +304,7 @@ def niw_posterior_update(niw_prior, sufficient_stats):
 
 
 def mniw_posterior_update(mniw_prior, sufficient_stats):
-    """Update the MatrixNormalInverseWishart (MNIW) distribution using sufficient statistics   
+    r"""Update the MatrixNormalInverseWishart (MNIW) distribution using sufficient statistics
 
     Returns:
         the posterior MNIW distribution
@@ -317,7 +319,7 @@ def mniw_posterior_update(mniw_prior, sufficient_stats):
     Sxx = V_pri + SxxT
     Sxy = SxyT + V_pri @ M_pri.T
     Syy = SyyT + M_pri @ V_pri @ M_pri.T
-    M_pos = jnp.linalg.solve(Sxx, Sxy).T
+    M_pos = psd_solve(Sxx, Sxy).T
     V_pos = Sxx
     nu_pos = nu_pri + N
     Psi_pos = Psi_pri + Syy - M_pos @ Sxy
@@ -325,8 +327,8 @@ def mniw_posterior_update(mniw_prior, sufficient_stats):
 
 
 def iw_posterior_update(iw_prior, sufficient_stats):
-    """Update the InverseWishart (IW) distribution using sufficient statistics
-    
+    r"""Update the InverseWishart (IW) distribution using sufficient statistics
+
     Returns:
         posterior IW distribution
     """
@@ -345,7 +347,7 @@ def iw_posterior_update(iw_prior, sufficient_stats):
 class NormalInverseGamma(tfd.JointDistributionSequential):
 
     def __new__(cls, *args, **kwargs):
-        # Patch for tfp 0.18.0. 
+        # Patch for tfp 0.18.0.
         # See https://github.com/tensorflow/probability/issues/1617
         return tfd.Distribution.__new__(cls)
 
@@ -388,11 +390,11 @@ class NormalInverseGamma(tfd.JointDistributionSequential):
         r"""Solve for the mode. Recall,
         ..math::
             p(\mu, \sigma^2) \propto
-                \mathrm{N}(\mu | \mu_0, \sigma^2 / \kappa_0) \times
-                \mathrm{IG}(\Sigma | \alpha_0, \beta_0)
+                \mathrm{N}(\mu \mid \mu_0, \sigma^2 / \kappa_0) \times
+                \mathrm{IG}(\Sigma \mid \alpha_0, \beta_0)
         The optimal mean is :math:`\mu^* = \mu_0`. Substituting this in,
         ..math::
-            p(\mu^*, \sigma^2) \propto IG(\sigma^2 | \alpha_0 + 0.5, \beta_0)
+            p(\mu^*, \sigma^2) \propto IG(\sigma^2 \mid \alpha_0 + 0.5, \beta_0)
         and the mode of this inverse gamma distribution is at
         ..math::
             (\sigma^2)* = \beta_0 / (\alpha_0 + 1.5)
@@ -402,7 +404,7 @@ class NormalInverseGamma(tfd.JointDistributionSequential):
 
 def nig_posterior_update(nig_prior, sufficient_stats):
     """Update the normal inverse gamma (NIG) distribution using sufficient statistics
-    
+
     Returns:
         posterior NIG distribution
     """

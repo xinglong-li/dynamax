@@ -31,7 +31,7 @@ To install the latest releast of dynamax from PyPi:
 .. code-block:: console
 
    pip install dynamax                 # Install dynamax and core dependencies, or
-   pip install dynamax[notebooks]      # Install with dep's for demo notebooks
+   pip install dynamax[notebooks]      # Install with demo notebook dependencies
 
 
 To install the latest development branch:
@@ -83,29 +83,28 @@ The corresponding joint distribution has the following form
 
 .. math::
 
-      p(y_{1:T}, z_{1:T} | u_{1:T}) = p(z_1 | u_1) p(y_1 | z_1, u_1) \prod_{t=1}^T p(z_t | z_{t-1}, u_t) p(y_t | z_t, u_t)
+      p(y_{1:T}, z_{1:T} \mid u_{1:T}) = p(z_1 \mid u_1) \prod_{t=2}^T p(z_t \mid z_{t-1}, u_t) \prod_{t=1}^T p(y_t \mid z_t, u_t)
 
 
-Here :math:`p(z_t | z_{t-1}, u_t)` is called the transition or dynamics model,
-and :math:`p(y_t | z_{t}, u_t)` is called the observation or emission model.
+Here :math:`p(z_t \mid z_{t-1}, u_t)` is called the transition or dynamics model,
+and :math:`p(y_t \mid z_{t}, u_t)` is called the observation or emission model.
 (In both cases, the inputs :math:`u_t` are optional;
 furthermore, the observation model may have auto-regressive dependencies,
-in which case we write  :math:`p(y_t | z_{t}, u_t, y_{1:t-1})`.)
+in which case we write  :math:`p(y_t \mid z_{t}, u_t, y_{1:t-1})`.)
 
 We assume that we see the observations :math:`y_{1:T}`,
 and want to infer the hidden states, either
-using online filtering (i.e., computing  :math:`p(z_t|y_{1:t})`)
-or offline smoothing (i.e., computing  :math:`p(z_t|y_{1:T})`).
+using online filtering (i.e., computing  :math:`p(z_t \mid y_{1:t})`)
+or offline smoothing (i.e., computing  :math:`p(z_t \mid y_{1:T})`).
 We may also be interested in predicting future states,
-:math:`p(z_{t+h}|y_{1:t})`,
+:math:`p(z_{t+h} \mid y_{1:t})`,
 or future observations,
-:math:`p(y_{t+h}|y_{1:t})`,
+:math:`p(y_{t+h} \mid y_{1:t})`,
 where h is the forecast horizon.
 (Note that by using a hidden state  to represent the past observations,
 the model can have "infinite" memory, unlike a standard auto-regressive model.)
-All of these computations can be done efficiently using our library,
-as we discuss below.
-In addition, we can estimate the parameters of the transition and emission models,
+All of these computations can be done efficiently using Dynamax.
+Moreover, you can use Dynamax to estimate the parameters of the transition and emission models,
 as we discuss below.
 
 More information can be found in these books:
@@ -113,10 +112,8 @@ More information can be found in these books:
    * "Machine Learning: Advanced Topics", K. Murphy, MIT Press 2023. Available at https://probml.github.io/pml-book/book2.html.
    * "Bayesian Filtering and Smoothing", S. Särkkä, Cambridge University Press, 2013. Available at https://users.aalto.fi/~ssarkka/pub/cup_book_online_20131111.pdf
 
-
-
-Example usage
----------------
+Quickstart
+----------
 
 Dynamax includes classes for many kinds of SSM.
 You can use these models to simulate data, and you can fit the models using standard
@@ -135,29 +132,54 @@ a runnable version of this code.)
    key1, key2, key3 = jr.split(jr.PRNGKey(0), 3)
    num_states = 3
    emission_dim = 2
-   num_timesteps = 100
+   num_timesteps = 1000
 
    # Make a Gaussian HMM and sample data from it
-   true_hmm = GaussianHMM(num_states, emission_dim)
-   true_params, _ = true_hmm.initialize(key1)
-   true_states, emissions = true_hmm.sample(true_params, key2, num_timesteps)
+   hmm = GaussianHMM(num_states, emission_dim)
+   true_params, _ = hmm.initialize(key1)
+   true_states, emissions = hmm.sample(true_params, key2, num_timesteps)
 
    # Make a new Gaussian HMM and fit it with EM
-   test_hmm = GaussianHMM(num_states, emission_dim)
-   params, props = test_hmm.initialize(key3)
-   params, lls = test_hmm.fit_em(params, props, emissions)
+   params, props = hmm.initialize(key3, method="kmeans", emissions=emissions)
+   params, lls = hmm.fit_em(params, props, emissions, num_iters=20)
 
    # Plot the marginal log probs across EM iterations
    plt.plot(lls)
    plt.xlabel("EM iterations")
    plt.ylabel("marginal log prob.")
 
-We can also call the low-level inference code directly.
+   # Use fitted model for posterior inference
+   post = hmm.smoother(params, emissions)
+   print(post.smoothed_probs.shape) # (1000, 3)
 
 
+JAX allows you to easily vectorize these operations with `vmap`.
+For example, you can sample and then fit to a batch of emissions as shown below.
 
-Notebooks
-==================
+.. code-block:: python
+
+   from functools import partial
+   from jax import vmap
+
+   num_seq = 200
+   batch_true_states, batch_emissions = \
+      vmap(partial(hmm.sample, true_params, num_timesteps=num_timesteps))(
+         jr.split(key2, num_seq))
+   print(batch_true_states.shape, batch_emissions.shape) # (200,1000) and (200,1000,2)
+
+   # Make a new Gaussian HMM and fit it with EM
+   params, props = hmm.initialize(key3, method="kmeans", emissions=batch_emissions)
+   params, lls = hmm.fit_em(params, props, batch_emissions, num_iters=20)
+
+You can also call the low-level inference code (e.g. :meth:`hmm_smoother`) directly,
+without first having to construct the HMM object.
+
+
+Tutorials
+=========
+
+The tutorials below will introduce you to state space models in Dynamax.
+If you're new to these models, we recommend you start at the top and work your way through!
 
 .. toctree::
    :maxdepth: 1
@@ -204,9 +226,10 @@ API documentation
 ==================
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 3
    :caption: API Documentation
 
+   types
    api
 
 

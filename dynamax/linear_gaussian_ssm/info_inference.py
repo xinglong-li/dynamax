@@ -4,6 +4,8 @@ from jax.scipy.linalg import solve_triangular
 from jaxtyping import Array, Float
 from typing import NamedTuple, Optional
 
+from dynamax.utils.utils import psd_solve
+
 
 class ParamsLGSSMInfo(NamedTuple):
     """Lightweight container for passing LGSSM parameters in information form to inference algorithms."""
@@ -22,22 +24,22 @@ class ParamsLGSSMInfo(NamedTuple):
     emission_bias: Optional[Float[Array, "emission_dim"]] = None
 
 
-class PosteriorLGSSMInfoFiltered(NamedTuple):
-    """Marginals of the Gaussian filtering posterior in information form.
+class PosteriorGSSMInfoFiltered(NamedTuple):
+    r"""Marginals of the Gaussian filtering posterior in information form.
 
     Attributes:
         marginal_loglik
         filtered_means: (T,K) array,
-            E[x_t | y_{1:t}, u_{1:t}].
+            E[x_t \mid y_{1:t}, u_{1:t}].
         filtered_precisions: (T,K,K) array,
-            inv(Cov[x_t | y_{1:t}, u_{1:t}]).
+            inv(Cov[x_t \mid y_{1:t}, u_{1:t}]).
     """
     marginal_loglik: Float[Array, ""] # Scalar
     filtered_etas: Float[Array, "ntime state_dim"]
     filtered_precisions: Float[Array, "ntime state_dim state_dim"]
 
 
-class PosteriorLGSSMInfoSmoothed(NamedTuple):
+class PosteriorGSSMInfoSmoothed(NamedTuple):
     """"Marginals of the Gaussian filtering and smoothed posterior in information form.
     """
     marginal_loglik: Float[Array, ""] # Scalar
@@ -57,7 +59,7 @@ def info_to_moment_form(etas, Lambdas):
         means (N,D)
         covs (N,D,D)
     """
-    means = vmap(jnp.linalg.solve)(Lambdas, etas)
+    means = vmap(lambda A, b:psd_solve(A, b))(Lambdas, etas)
     covs = jnp.linalg.inv(Lambdas)
     return means, covs
 
@@ -79,28 +81,28 @@ def _mvn_info_log_prob(eta, Lambda, x):
     """
     D = len(Lambda)
     lp = x.T @ eta - 0.5 * x.T @ Lambda @ x
-    lp += -0.5 * eta.T @ jnp.linalg.solve(Lambda, eta)
+    lp += -0.5 * eta.T @ psd_solve(Lambda, eta)
     sign, logdet = jnp.linalg.slogdet(Lambda)
     lp += -0.5 * (D * jnp.log(2 * jnp.pi) - sign * logdet)
     return lp
 
 
 def _info_predict(eta, Lambda, F, Q_prec, B, u, b):
-    """Predict next mean and precision under a linear Gaussian model.
+    r"""Predict next mean and precision under a linear Gaussian model.
 
     Marginalising over the uncertainty in z_t the predicted latent state at
     the next time step is given by:
-        p(z_{t+1}| z_t, u_t)
-            = \int p(z_{t+1}, z_t | u_t) dz_t
-            = \int N(z_t | mu_t, Sigma_t) N(z_{t+1} | F z_t + B u_t + b, Q) dz_t
-            = N(z_t | m_{t+1|t}, Sigma_{t+1|t})
+        p(z_{t+1}\mid z_t, u_t)
+            = \int p(z_{t+1}, z_t \mid u_t) dz_t
+            = \int N(z_t \mid mu_t, Sigma_t) N(z_{t+1} \mid F z_t + B u_t + b, Q) dz_t
+            = N(z_t \mid m_{t+1\midt}, Sigma_{t+1\mid t})
     with
-        m_{t+1|t} = F m_t + B u_t + b
-        Sigma_{t+1|t} = F Sigma_t F^T + Q
+        m_{t+1 \mid t} = F m_t + B u_t + b
+        Sigma_{t+1 \mid t} = F Sigma_t F^T + Q
 
     The corresponding information form parameters are:
-        eta_{t+1|t} = K eta_t + Lambda_{t+1|t} (B u_t + b)
-        Lambda_{t+1|t} = L Q_prec L^T + K Lambda_t K^T
+        eta_{t+1 \mid t} = K eta_t + Lambda_{t+1 \mid t} (B u_t + b)
+        Lambda_{t+1 \mid t} = L Q_prec L^T + K Lambda_t K^T
     where
         K = Q_prec F ( Lambda_t + F^T Q_prec F)^{-1}
         L = I - K F^T
@@ -118,7 +120,7 @@ def _info_predict(eta, Lambda, F, Q_prec, B, u, b):
         eta_pred (D_hid,): predicted precision weighted mean.
         Lambda_pred (D_hid,D_hid): predicted precision.
     """
-    K = jnp.linalg.solve(Lambda + F.T @ Q_prec @ F, F.T @ Q_prec).T
+    K = psd_solve(Lambda + F.T @ Q_prec @ F, F.T @ Q_prec).T
     I = jnp.eye(F.shape[0])
     ## This version should be more stable than:
     # Lambda_pred = (I - K @ F.T) @ Q_prec
@@ -129,19 +131,19 @@ def _info_predict(eta, Lambda, F, Q_prec, B, u, b):
 
 
 def _info_condition_on(eta, Lambda, H, R_prec, D, u, d, obs):
-    """Condition a Gaussian potential on a new linear Gaussian observation.
+    r"""Condition a Gaussian potential on a new linear Gaussian observation.
 
-        p(z_t|y_t, u_t) \prop  N(z_t | mu_{t|t-1}, Sigma_{t|t-1}) *
-                          N(y_t | H z_t + D u_t + d, R)
+        p(z_t \mid y_t, u_t) \prop  N(z_t  \mid  mu_{t \mid t-1}, Sigma_{t \mid t-1}) *
+                          N(y_t  \mid  H z_t + D u_t + d, R)
 
     The prior precision and precision-weighted mean are given by:
-        Lambda_{t|t-1} = Sigma_{t|t-1}^{-1}
-        eta_{t|t-1} = Lambda{t|t-1} mu_{t|t-1},
+        Lambda_{t \mid t-1} = Sigma_{t \mid t-1}^{-1}
+        eta_{t \mid t-1} = Lambda{t \mid t-1} mu_{t \mid t-1},
     respectively.
 
     The upated parameters are then:
-        Lambda_t = Lambda_{t|t-1} + H^T R_prec H
-        eta_t = eta_{t|t-1} + H^T R_prec (y_t - Du - d)
+        Lambda_t = Lambda_{t \mid t-1} + H^T R_prec H
+        eta_t = eta_{t \mid t-1} + H^T R_prec (y_t - Du - d)
 
     Args:
         eta (D_hid,): prior precision weighted mean.
@@ -167,8 +169,8 @@ def lgssm_info_filter(
     params: ParamsLGSSMInfo,
     emissions: Float[Array, "ntime emission_dim"],
     inputs: Optional[Float[Array, "ntime input_dim"]] = None
-) -> PosteriorLGSSMInfoFiltered:
-    """Run a Kalman filter to produce the filtered state estimates.
+) -> PosteriorGSSMInfoFiltered:
+    r"""Run a Kalman filter to produce the filtered state estimates.
 
     Args:
         params: an LGSSMInfoParams instance.
@@ -213,15 +215,15 @@ def lgssm_info_filter(
     initial_eta = params.initial_precision @ params.initial_mean
     carry = (0.0, initial_eta, params.initial_precision)
     (ll, _, _), (filtered_etas, filtered_precisions) = lax.scan(_filter_step, carry, jnp.arange(num_timesteps))
-    return PosteriorLGSSMInfoFiltered(marginal_loglik=ll, filtered_etas=filtered_etas, filtered_precisions=filtered_precisions)
+    return PosteriorGSSMInfoFiltered(marginal_loglik=ll, filtered_etas=filtered_etas, filtered_precisions=filtered_precisions)
 
 
 def lgssm_info_smoother(
     params: ParamsLGSSMInfo,
     emissions: Float[Array, "ntime emission_dim"],
     inputs: Optional[Float[Array, "ntime input_dim"]] = None
-) -> PosteriorLGSSMInfoSmoothed:
-    """Run forward-filtering, backward-smoother to compute expectations
+) -> PosteriorGSSMInfoSmoothed:
+    r"""Run forward-filtering, backward-smoother to compute expectations
     under the posterior distribution on latent states. This
     is the information form of the Rauch-Tung-Striebel (RTS) smoother.
 
@@ -260,7 +262,7 @@ def lgssm_info_smoother(
 
         # This is the information form version of the 'reverse' Kalman gain
         # See Eq 8.11 of Saarka's "Bayesian Filtering and Smoothing"
-        G = jnp.linalg.solve(Q_prec + smoothed_prec_next - pred_prec, Q_prec @ F)
+        G = psd_solve(Q_prec + smoothed_prec_next - pred_prec, Q_prec @ F)
 
         # Compute the smoothed parameter estimates
         smoothed_prec = filtered_prec + F.T @ Q_prec @ (F - G)
@@ -276,7 +278,7 @@ def lgssm_info_smoother(
     # Reverse the arrays and return
     smoothed_etas = jnp.row_stack((smoothed_etas[::-1], filtered_etas[-1][None, ...]))
     smoothed_precisions = jnp.row_stack((smoothed_precisions[::-1], filtered_precisions[-1][None, ...]))
-    return PosteriorLGSSMInfoSmoothed(
+    return PosteriorGSSMInfoSmoothed(
         marginal_loglik=ll,
         filtered_etas=filtered_etas,
         filtered_precisions=filtered_precisions,
@@ -286,7 +288,7 @@ def lgssm_info_smoother(
 
 
 def block_tridiag_mvn_log_normalizer(precision_diag_blocks, precision_lower_diag_blocks, linear_potential):
-    """
+    r"""
     Compute the log normalizing constant for a multivariate normal distribution
     with natural parameters :math:`J` and :math:`h` with density,
     ..math:
@@ -294,7 +296,7 @@ def block_tridiag_mvn_log_normalizer(precision_diag_blocks, precision_lower_diag
 
     where the log normalizer is
     ..math:
-        \log Z = N/2 \log 2 \pi - \log |J| + 1/2 h^T J^{-1} h
+        \log Z = N/2 \log 2 \pi - \log  |J| + 1/2 h^T J^{-1} h
 
     and :math:`N` is the dimensionality.
 
@@ -395,18 +397,18 @@ def lds_to_block_tridiag(lds, data, inputs):
     T = len(data)
 
     # diagonal blocks of precision matrix
-    J_diag = jnp.array([jnp.dot(C(t).T, jnp.linalg.solve(R(t), C(t))) for t in range(T)])
+    J_diag = jnp.array([jnp.dot(C(t).T, psd_solve(R(t), C(t))) for t in range(T)])
     J_diag = J_diag.at[0].add(jnp.linalg.inv(Q0))
-    J_diag = J_diag.at[:-1].add(jnp.array([jnp.dot(A(t).T, jnp.linalg.solve(Q(t), A(t))) for t in range(T - 1)]))
+    J_diag = J_diag.at[:-1].add(jnp.array([jnp.dot(A(t).T, psd_solve(Q(t), A(t))) for t in range(T - 1)]))
     J_diag = J_diag.at[1:].add(jnp.array([jnp.linalg.inv(Q(t)) for t in range(0, T - 1)]))
 
     # lower diagonal blocks of precision matrix
-    J_lower_diag = jnp.array([-jnp.linalg.solve(Q(t), A(t)) for t in range(T - 1)])
+    J_lower_diag = jnp.array([-psd_solve(Q(t), A(t)) for t in range(T - 1)])
 
     # linear potential
-    h = jnp.array([jnp.dot(data[t] - D(t) @ inputs[t], jnp.linalg.solve(R(t), C(t))) for t in range(T)])
-    h = h.at[0].add(jnp.linalg.solve(Q0, m0))
-    h = h.at[:-1].add(jnp.array([-jnp.dot(A(t).T, jnp.linalg.solve(Q(t), B(t) @ inputs[t])) for t in range(T - 1)]))
-    h = h.at[1:].add(jnp.array([jnp.linalg.solve(Q(t), B(t) @ inputs[t]) for t in range(T - 1)]))
+    h = jnp.array([jnp.dot(data[t] - D(t) @ inputs[t], psd_solve(R(t), C(t))) for t in range(T)])
+    h = h.at[0].add(psd_solve(Q0, m0))
+    h = h.at[:-1].add(jnp.array([-jnp.dot(A(t).T, psd_solve(Q(t), B(t) @ inputs[t])) for t in range(T - 1)]))
+    h = h.at[1:].add(jnp.array([psd_solve(Q(t), B(t) @ inputs[t]) for t in range(T - 1)]))
 
     return J_diag, J_lower_diag, h

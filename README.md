@@ -4,10 +4,6 @@
 
 ![Test Status](https://github.com/probml/dynamax/actions/workflows/run_tests.yml/badge.svg?branch=main)
 
-
-***Note: the code is currently under active development, and the API will soon change. Please wait for the official release
-on 11/14/22 before using.***
-
 Dynamax is a library for probabilistic state space models (SSMs) written
 in [JAX](https://github.com/google/jax). It has code for inference
 (state estimation) and learning (parameter estimation) in a variety of
@@ -31,7 +27,7 @@ sequential Monte Carlo (SMC)).
 
 ## Documentation
 
-For examples and API, see the docs: https://probml.github.io/dynamax/.
+For tutorials and API documentation, see: https://probml.github.io/dynamax/.
 
 ## Installation and Testing
 
@@ -39,7 +35,7 @@ To install the latest releast of dynamax from PyPi:
 
 ``` {.console}
 pip install dynamax                 # Install dynamax and core dependencies, or
-pip install dynamax[notebooks]      # Install with dep's for demo notebooks
+pip install dynamax[notebooks]      # Install with demo notebook dependencies
 ```
 
 To install the latest development branch:
@@ -118,7 +114,7 @@ for the case of an HMM with Gaussian emissions. (See [this
 notebook](https://github.com/probml/dynamax/blob/main/docs/notebooks/hmm/gaussian_hmm.ipynb)
 for a runnable version of this code.)
 
-``` {.python}
+```python
 import jax.numpy as jnp
 import jax.random as jr
 import matplotlib.pyplot as plt
@@ -127,26 +123,52 @@ from dynamax.hidden_markov_model import GaussianHMM
 key1, key2, key3 = jr.split(jr.PRNGKey(0), 3)
 num_states = 3
 emission_dim = 2
-num_timesteps = 100
+num_timesteps = 1000
 
 # Make a Gaussian HMM and sample data from it
-true_hmm = GaussianHMM(num_states, emission_dim)
-true_params, _ = true_hmm.initialize(key1)
-true_states, emissions = true_hmm.sample(true_params, key2, num_timesteps)
+hmm = GaussianHMM(num_states, emission_dim)
+true_params, _ = hmm.initialize(key1)
+true_states, emissions = hmm.sample(true_params, key2, num_timesteps)
 
 # Make a new Gaussian HMM and fit it with EM
-test_hmm = GaussianHMM(num_states, emission_dim)
-params, props = test_hmm.initialize(key3)
-params, lls = test_hmm.fit_em(params, props, emissions)
+params, props = hmm.initialize(key3, method="kmeans", emissions=emissions)
+params, lls = hmm.fit_em(params, props, emissions, num_iters=20)
 
 # Plot the marginal log probs across EM iterations
 plt.plot(lls)
 plt.xlabel("EM iterations")
 plt.ylabel("marginal log prob.")
+
+# Use fitted model for posterior inference
+post = hmm.smoother(params, emissions)
+print(post.smoothed_probs.shape) # (1000, 3)
 ```
 
-We can also call the low-level inference code directly.
+JAX allows you to easily vectorize these operations with `vmap`.
+For example, you can sample and fit to a batch of emissions as shown below.
 
+```python
+from functools import partial
+from jax import vmap
+
+num_seq = 200
+batch_true_states, batch_emissions = \
+    vmap(partial(hmm.sample, true_params, num_timesteps=num_timesteps))(
+        jr.split(key2, num_seq))
+print(batch_true_states.shape, batch_emissions.shape) # (200,1000) and (200,1000,2)
+
+# Make a new Gaussian HMM and fit it with EM
+params, props = hmm.initialize(key3, method="kmeans", emissions=batch_emissions)
+params, lls = hmm.fit_em(params, props, batch_emissions, num_iters=20)
+```
+
+These examples demonstrate the dynamax models, but we can also call the low-level
+inference code directly.
+
+## Contributing
+
+Please see [this page](https://github.com/probml/dynamax/blob/main/CONTRIBUTING.md) for details
+on how to contribute.
 
 ## About
 Core team: Peter Chang, Giles Harper-Donnelly, Aleyna Kara, Xinglong Li, Scott Linderman, Kevin Murphy.

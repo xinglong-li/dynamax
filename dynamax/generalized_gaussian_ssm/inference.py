@@ -2,12 +2,14 @@ from itertools import product
 from numpy.polynomial.hermite_e import hermegauss
 from jax import jacfwd, vmap, lax
 import jax.numpy as jnp
+from jax import lax
 from tensorflow_probability.substrates.jax.distributions import MultivariateNormalFullCovariance as MVN
 from jaxtyping import Array, Float
 from typing import NamedTuple, Optional, Union, Callable
 
-from dynamax.generalized_gaussian_ssm.models import ParamsGGSSM,  PosteriorGGSSMFiltered, PosteriorGGSSMSmoothed
-
+from dynamax.utils.utils import psd_solve
+from dynamax.generalized_gaussian_ssm.models import ParamsGGSSM
+from dynamax.linear_gaussian_ssm.inference import PosteriorGSSMFiltered, PosteriorGSSMSmoothed
 
 # Helper functions
 _get_params = lambda x, dim, t: x[t] if x.ndim == dim + 1 else x
@@ -16,23 +18,15 @@ _process_input = lambda x, y: jnp.zeros((y,)) if x is None else x
 _jacfwd_2d = lambda f, x: jnp.atleast_2d(jacfwd(f)(x))
 
 
-"""
-Parameter structures are represented as NamedTuples.
-(NamedTuples do not easily support inheritance, so we define
-the CMGFIntegrals "meta-type" below.)
-"""
+
 class EKFIntegrals(NamedTuple):
-    """
-    Lightweight container for EKF Gaussian integrals.
-    """
+    """ Lightweight container for EKF Gaussian integrals."""
     gaussian_expectation: Callable = lambda f, m, P: jnp.atleast_1d(f(m))
     gaussian_cross_covariance: Callable = lambda f, g, m, P: _jacfwd_2d(f, m) @ P @ _jacfwd_2d(g, m).T
 
 
 class UKFIntegrals(NamedTuple):
-    """
-    Lightweight container for UKF Gaussian integrals.
-    """
+    """Lightweight container for UKF Gaussian integrals."""
     alpha: float = jnp.sqrt(3)
     beta: float = 2.0
     kappa: float = 1.0
@@ -63,9 +57,7 @@ class UKFIntegrals(NamedTuple):
 
 
 class GHKFIntegrals(NamedTuple):
-    """
-    Lightweight container for GHKF Gaussian integrals.
-    """
+    """Lightweight container for GHKF Gaussian integrals."""
     order: int = 10
 
     def gaussian_expectation(self, f, m, P):
@@ -93,7 +85,7 @@ CMGFIntegrals = Union[EKFIntegrals, UKFIntegrals, GHKFIntegrals]
 
 def _predict(m, P, f, Q, u, g_ev, g_cov):
     """Predict next mean and covariance under an additive-noise Gaussian filter
-
+    
         p(x_{t+1}) = N(x_{t+1} | mu_pred, Sigma_pred)
         where
             mu_pred = gev(f, m, P)
@@ -125,7 +117,7 @@ def _predict(m, P, f, Q, u, g_ev, g_cov):
     return mu_pred, Sigma_pred, cross_pred
 
 
-def _condition_on(m, P, y_cond_mean, y_cond_cov, u, y, g_ev, g_cov, num_iter):
+def _condition_on(m, P, y_cond_mean, y_cond_cov, u, y, g_ev, g_cov, num_iter, emission_dist):
     """Condition a Gaussian potential on a new observation with arbitrary
        likelihood with given functions for conditional moments and make a
        Gaussian approximation.
@@ -151,6 +143,7 @@ def _condition_on(m, P, y_cond_mean, y_cond_cov, u, y, g_ev, g_cov, num_iter):
         g_ev (Callable): Gaussian expectation value function.
         g_cov (Callable): Gaussian cross covariance function.
         num_iter (int): number of re-linearizations around posterior for update step.
+        emission_dist: the observation pdf q. Constructed from specified mean and covariance.
 
      Returns:
         log_likelihood (Scalar): prediction log likelihood for observation y
@@ -166,9 +159,9 @@ def _condition_on(m, P, y_cond_mean, y_cond_cov, u, y, g_ev, g_cov, num_iter):
         prior_mean, prior_cov = carry
         yhat = g_ev(m_Y, prior_mean, prior_cov)
         S = g_ev(Cov_Y, prior_mean, prior_cov) + g_cov(m_Y, m_Y, prior_mean, prior_cov)
-        log_likelihood = MVN(yhat, S).log_prob(jnp.atleast_1d(y))
+        log_likelihood = emission_dist(yhat, S).log_prob(jnp.atleast_1d(y)).sum()
         C = g_cov(identity_fn, m_Y, prior_mean, prior_cov)
-        K = jnp.linalg.solve(S, C.T).T
+        K = psd_solve(S, C.T).T
         posterior_mean = prior_mean + K @ (y - yhat)
         posterior_cov = prior_cov - K @ S @ K.T
         return (posterior_mean, posterior_cov), log_likelihood
@@ -182,6 +175,7 @@ def _condition_on(m, P, y_cond_mean, y_cond_cov, u, y, g_ev, g_cov, num_iter):
 def _statistical_linear_regression(mu, Sigma, m, S, C):
     """Return moment-matching affine coefficients and approximation noise variance
     given joint moments.
+
         g(x) \approx Ax + b + e where e ~ N(0, Omega)
         p(x) = N(x | mu, Sigma)
         m = E[g(x)]
@@ -200,7 +194,7 @@ def _statistical_linear_regression(mu, Sigma, m, S, C):
         b (D_obs):
         Omega (D_obs, D_obs):
     """
-    A = jnp.linalg.solve(Sigma.T, C).T
+    A = psd_solve(Sigma.T, C).T
     b = m - A @ mu
     Omega = S - A @ Sigma @ A.T
     return A, b, Omega
@@ -212,22 +206,19 @@ def conditional_moments_gaussian_filter(
     emissions: Float[Array, "ntime emission_dim"],
     num_iter: int = 1,
     inputs: Optional[Float[Array, "ntime input_dim"]]=None
-) -> PosteriorGGSSMFiltered:
+) -> PosteriorGSSMFiltered:
     """Run an (iterated) conditional moments Gaussian filter to produce the
     marginal likelihood and filtered state estimates.
 
     Args:
-        model_params (GGSSMParams): model parameters.
-        inf_params (CMGFIntegrals): inference parameters.
-        emissions (T,D_hid): array of observations.
-        num_iter (int): number of linearizations around prior/posterior for update step.
-        inputs (T,D_in): array of inputs.
+        model_params: model parameters.
+        inf_params: inference parameters that specify how to compute moments.
+        emissions: array of observations.
+        num_iter: optional number of linearizations around prior/posterior for update step (default 1).
+        inputs: optopnal array of inputs.
 
     Returns:
-        filtered_posterior: GSSMPosterior instance containing,
-            marginal_log_lik
-            filtered_means (T, D_hid)
-            filtered_covariances (T, D_hid, D_hid)
+        filtered_posterior: posterior object.
 
     """
     num_timesteps = len(emissions)
@@ -242,6 +233,9 @@ def conditional_moments_gaussian_filter(
     g_ev = inf_params.gaussian_expectation
     g_cov = inf_params.gaussian_cross_covariance
 
+    # Emission distribution
+    emission_dist = model_params.emission_dist
+
     def _step(carry, t):
         ll, pred_mean, pred_cov = carry
 
@@ -251,7 +245,7 @@ def conditional_moments_gaussian_filter(
         y = emissions[t]
 
         # Condition on the emission
-        log_likelihood, filtered_mean, filtered_cov = _condition_on(pred_mean, pred_cov, m_Y, Cov_Y, u, y, g_ev, g_cov, num_iter)
+        log_likelihood, filtered_mean, filtered_cov = _condition_on(pred_mean, pred_cov, m_Y, Cov_Y, u, y, g_ev, g_cov, num_iter, emission_dist)
         ll += log_likelihood
 
         # Predict the next state
@@ -262,7 +256,7 @@ def conditional_moments_gaussian_filter(
     # Run the general linearization filter
     carry = (0.0, model_params.initial_mean, model_params.initial_covariance)
     (ll, _, _), (filtered_means, filtered_covs) = lax.scan(_step, carry, jnp.arange(num_timesteps))
-    return PosteriorGGSSMFiltered(marginal_loglik=ll, filtered_means=filtered_means, filtered_covariances=filtered_covs)
+    return PosteriorGSSMFiltered(marginal_loglik=ll, filtered_means=filtered_means, filtered_covariances=filtered_covs)
 
 
 def iterated_conditional_moments_gaussian_filter(
@@ -271,22 +265,18 @@ def iterated_conditional_moments_gaussian_filter(
     emissions: Float[Array, "ntime emission_dim"],
     num_iter: int = 2,
     inputs: Optional[Float[Array, "ntime input_dim"]]=None
-) -> PosteriorGGSSMFiltered:
+) -> PosteriorGSSMFiltered:
     """Run an iterated conditional moments Gaussian filter.
 
     Args:
-        model_params (GGSSMParams): model parameters.
-        inf_params (CMGFIntegrals): inference parameters.
-        emissions (T,D_hid): array of observations.
-        num_iter (int): number of linearizations around smoothed posterior.
-        inputs (T,D_in): array of inputs.
+        model_params: model parameters.
+        inf_params: inference parameters that specify how to compute moments.
+        emissions: array of observations.
+        num_iter: optional number of linearizations around prior/posterior for update step (default 1).
+        inputs: optional array of inputs.
 
     Returns:
-        filtered_posterior: GSSMPosterior instance containing,
-            marginal_log_lik
-            filtered_means (T, D_hid)
-            filtered_covariances (T, D_hid, D_hid)
-
+        filtered_posterior: posterior object.
     """
     filtered_posterior = conditional_moments_gaussian_filter(model_params, inf_params, emissions, num_iter, inputs)
     return filtered_posterior
@@ -296,26 +286,20 @@ def conditional_moments_gaussian_smoother(
     model_params: ParamsGGSSM,
     inf_params: CMGFIntegrals,
     emissions: Float[Array, "ntime emission_dim"],
-    filtered_posterior: Optional[PosteriorGGSSMFiltered]=None,
+    filtered_posterior: Optional[PosteriorGSSMFiltered]=None,
     inputs: Optional[Float[Array, "ntime input_dim"]]=None
-) -> PosteriorGGSSMSmoothed:
+) -> PosteriorGSSMSmoothed:
     """Run a conditional moments Gaussian smoother.
 
     Args:
-        model_params (GGSSMParams): model parameters.
-
-        inf_params (CMGFIntegrals): inference parameters.
-
-        emissions (T,D_hid): array of observations.
-
-        filtered_posterior (GSSMPosterior): filtered posterior to use for smoothing.
-        If None, the smoother computes the filtered posterior directly.
-
-        inputs (T,D_in): array of inputs.
+        model_params: model parameters.
+        inf_params: inference parameters that specify how to compute moments.
+        emissions: array of observations.
+        num_iter: optional number of linearizations around prior/posterior for update step (default 1).
+        inputs: optopnal array of inputs.
 
     Returns:
-        nlgssm_posterior: GSSMPosterior instance containing properties of
-        filtered and smoothed posterior distributions.
+        post: posterior object.
 
     """
     num_timesteps = len(emissions)
@@ -344,7 +328,7 @@ def conditional_moments_gaussian_smoother(
 
         # Prediction step
         pred_mean, pred_cov, pred_cross = _predict(filtered_mean, filtered_cov, f, Q, u, g_ev, g_cov)
-        G = jnp.linalg.solve(pred_cov, pred_cross.T).T
+        G = psd_solve(pred_cov, pred_cross.T).T
 
         # Compute smoothed mean and covariance
         smoothed_mean = filtered_mean + G @ (smoothed_mean_next - pred_mean)
@@ -360,7 +344,7 @@ def conditional_moments_gaussian_smoother(
     # Reverse the arrays and return
     smoothed_means = jnp.row_stack((smoothed_means[::-1], filtered_means[-1][None, ...]))
     smoothed_covs = jnp.row_stack((smoothed_covs[::-1], filtered_covs[-1][None, ...]))
-    return PosteriorGGSSMSmoothed(
+    return PosteriorGSSMSmoothed(
         marginal_loglik=ll,
         filtered_means=filtered_means,
         filtered_covariances=filtered_covs,
@@ -375,19 +359,19 @@ def iterated_conditional_moments_gaussian_smoother(
     emissions: Float[Array, "ntime emission_dim"],
     num_iter: int = 2,
     inputs: Optional[Float[Array, "ntime input_dim"]]=None
-) -> PosteriorGGSSMSmoothed:
+) -> PosteriorGSSMSmoothed:
     """Run an iterated conditional moments Gaussian smoother.
 
     Args:
-        model_params (GGSSMParams): model parameters.
-        inf_params (CMGFIntegrals): inference parameters.
-        emissions (T,D_hid): array of observations.
-        num_iter (int): number of re-linearizations around smoothed posterior.
-        inputs (T,D_in): array of inputs.
+        model_params: model parameters.
+        inf_params: inference parameters that specify how to compute moments.
+        emissions: array of observations.
+        num_iter: optional number of linearizations around prior/posterior for update step (default 1).
+        inputs: optopnal array of inputs.
 
     Returns:
-        nlgssm_posterior: GSSMPosterior instance containing properties of
-            filtered and smoothed posterior distributions.
+        post: posterior object.
+
     """
     def _step(carry, _):
         # Relinearize around smoothed posterior from previous iteration

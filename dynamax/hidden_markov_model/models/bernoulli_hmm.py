@@ -1,14 +1,19 @@
+from typing import NamedTuple, Optional, Tuple, Union
+
 import jax.numpy as jnp
 import jax.random as jr
 import tensorflow_probability.substrates.jax.bijectors as tfb
 import tensorflow_probability.substrates.jax.distributions as tfd
-from dynamax.parameters import ParameterProperties
-from dynamax.hidden_markov_model.models.abstractions import HMMEmissions, HMM
-from dynamax.hidden_markov_model.models.initial import StandardHMMInitialState, ParamsStandardHMMInitialState
-from dynamax.hidden_markov_model.models.transitions import StandardHMMTransitions, ParamsStandardHMMTransitions
+from jaxtyping import Array, Float
+
+from dynamax.hidden_markov_model.models.abstractions import HMM, HMMEmissions
+from dynamax.hidden_markov_model.models.initial import ParamsStandardHMMInitialState
+from dynamax.hidden_markov_model.models.initial import StandardHMMInitialState
+from dynamax.hidden_markov_model.models.transitions import ParamsStandardHMMTransitions
+from dynamax.hidden_markov_model.models.transitions import StandardHMMTransitions
+from dynamax.parameters import ParameterProperties, ParameterSet, PropertySet
+from dynamax.types import Scalar
 from dynamax.utils.utils import pytree_sum
-from jaxtyping import Float, Array
-from typing import NamedTuple, Union
 
 
 class ParamsBernoulliHMMEmissions(NamedTuple):
@@ -92,24 +97,46 @@ class BernoulliHMMEmissions(HMMEmissions):
 
 
 class BernoulliHMM(HMM):
+    r"""An HMM with conditionally independent Bernoulli emissions.
+
+    Let $y_t \in \{0,1\}^N$ denote a binary vector of emissions at time $t$. In this model,
+    the emission distribution is,
+
+    $$p(y_t \mid z_t, \theta) = \prod_{n=1}^N \mathrm{Bern}(y_{tn} \mid \theta_{z_t,n})$$
+    $$p(\theta) = \prod_{k=1}^K \prod_{n=1}^N \mathrm{Beta}(\theta_{k,n}; \gamma_0, \gamma_1)$$
+
+    with $\theta_{k,n} \in [0,1]$ for $k=1,\ldots,K$ and $n=1,\ldots,N$ are the
+    *emission probabilities* and $\gamma_0, \gamma_1$ are their prior pseudocounts.
+
+    :param num_states: number of discrete states $K$
+    :param emission_dim: number of conditionally independent emissions $N$
+    :param initial_probs_concentration: $\alpha$
+    :param transition_matrix_concentration: $\beta$
+    :param transition_matrix_stickiness: optional hyperparameter to boost the concentration on the diagonal of the transition matrix.
+    :param emission_prior_concentration0: $\gamma_0$
+    :param emission_prior_concentration1: $\gamma_1$
+
+    """
     def __init__(self, num_states: int,
                  emission_dim: int,
-                 initial_probs_concentration=1.1,
-                 transition_matrix_concentration=1.1,
-                 emission_prior_concentration0=1.1,
-                 emission_prior_concentration1=1.1):
+                 initial_probs_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
+                 transition_matrix_concentration: Union[Scalar, Float[Array, "num_states"]]=1.1,
+                 transition_matrix_stickiness: Scalar=0.0,
+                 emission_prior_concentration0: Scalar=1.1,
+                 emission_prior_concentration1: Scalar=1.1):
         self.emission_dim = emission_dim
         initial_component = StandardHMMInitialState(num_states, initial_probs_concentration=initial_probs_concentration)
-        transition_component = StandardHMMTransitions(num_states, transition_matrix_concentration=transition_matrix_concentration)
+        transition_component = StandardHMMTransitions(num_states, concentration=transition_matrix_concentration, stickiness=transition_matrix_stickiness)
         emission_component = BernoulliHMMEmissions(num_states, emission_dim, emission_prior_concentration0=emission_prior_concentration0, emission_prior_concentration1=emission_prior_concentration1)
         super().__init__(num_states, initial_component, transition_component, emission_component)
 
     def initialize(self,
                    key: jr.PRNGKey=jr.PRNGKey(0),
                    method: str="prior",
-                   initial_probs: jnp.array=None,
-                   transition_matrix: jnp.array=None,
-                   emission_probs: jnp.array=None):
+                   initial_probs: Optional[Float[Array, "num_states"]]=None,
+                   transition_matrix: Optional[Float[Array, "num_states num_states"]]=None,
+                   emission_probs: Optional[Float[Array, "num_states emission_dim"]]=None
+    ) -> Tuple[ParameterSet, PropertySet]:
         """Initialize the model parameters and their corresponding properties.
 
         You can either specify parameters manually via the keyword arguments, or you can have
@@ -119,15 +146,14 @@ class BernoulliHMM(HMM):
         Note: in the future we may support more initialization schemes, like K-Means.
 
         Args:
-            key (PRNGKey, optional): random number generator for unspecified parameters. Must not be None if there are any unspecified parameters. Defaults to jr.PRNGKey(0).
-            method (str, optional): method for initializing unspecified parameters. Currently, only "prior" is allowed. Defaults to "prior".
-            initial_probs (array, optional): manually specified initial state probabilities. Defaults to None.
-            transition_matrix (array, optional): manually specified transition matrix. Defaults to None.
-            emission_probs (array, optional): manually specified emission probabilities. Defaults to None.
+            key: random number generator for unspecified parameters. Must not be None if there are any unspecified parameters. Defaults to jr.PRNGKey(0).
+            method: method for initializing unspecified parameters. Currently, only "prior" is allowed. Defaults to "prior".
+            initial_probs: manually specified initial state probabilities. Defaults to None.
+            transition_matrix: manually specified transition matrix. Defaults to None.
+            emission_probs: manually specified emission probabilities. Defaults to None.
 
         Returns:
-            params: nested dataclasses of arrays containing model parameters.
-            props: a nested dictionary of ParameterProperties to specify parameter constraints and whether or not they should be trained.
+            Model parameters and their properties.
         """
         key1, key2, key3 = jr.split(key , 3)
         params, props = dict(), dict()
